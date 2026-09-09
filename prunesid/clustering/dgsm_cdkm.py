@@ -35,57 +35,6 @@ def kmeans_plusplus_init(data: np.ndarray, k: int, rng: np.random.Generator) -> 
     return centers_idx
 
 
-def normalize_attention(attention: np.ndarray) -> np.ndarray:
-    """Min-max normalize attention to [0, 1]."""
-    attention = np.asarray(attention, dtype=np.float32).reshape(-1)
-    amin = float(attention.min())
-    amax = float(attention.max())
-    return (attention - amin) / (amax - amin + 1e-8)
-
-
-def semantic_kmeans_plusplus_init(
-    data: np.ndarray,
-    k: int,
-    attention: np.ndarray,
-    rng: np.random.Generator,
-    alpha: float = 1.0,
-) -> np.ndarray:
-    """
-    Semantic-aware k-means++ initialization.
-
-    First center ~ attention; later centers ~ D_i^2 * (1 + alpha * A_i).
-    alpha=0 reduces to (almost) classic k-means++ after the first pick.
-    """
-    n = data.shape[0]
-    k = min(k, n)
-    attn = normalize_attention(attention)
-    if attn.shape[0] != n:
-        raise ValueError(f"attention length {attn.shape[0]} != n={n}")
-
-    centers_idx = np.empty(k, dtype=np.int64)
-    # First center: attention-weighted
-    prob0 = attn + 1e-6
-    prob0 = prob0 / prob0.sum()
-    centers_idx[0] = int(rng.choice(n, p=prob0))
-
-    closest_dist_sq = np.full(n, np.inf, dtype=np.float32)
-    alpha = float(alpha)
-
-    for c in range(1, k):
-        last = data[centers_idx[c - 1]]
-        dist_sq = np.sum((data - last) ** 2, axis=1)
-        np.minimum(closest_dist_sq, dist_sq, out=closest_dist_sq)
-
-        semantic_score = closest_dist_sq * (1.0 + alpha * attn)
-        total = float(semantic_score.sum())
-        if total <= 0 or not np.isfinite(total):
-            centers_idx[c:] = rng.choice(n, size=k - c, replace=False)
-            break
-        probs = semantic_score / total
-        centers_idx[c] = int(rng.choice(n, p=probs))
-    return centers_idx
-
-
 def _cluster_ave_var_from_F(
     F: np.ndarray, temp0: np.ndarray, temp1: np.ndarray, point_sq: np.ndarray, c: int
 ) -> float:
@@ -346,16 +295,15 @@ def dgsm_cdkm(
     rng: Optional[np.random.Generator] = None,
     max_cd_iters: int = 8,
     do_split_merge: bool = True,
-    attention: Optional[np.ndarray] = None,
-    alpha: float = 1.0,
-    init_method: str = "kpp",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Run DGSM-CDKM (core CD / split-merge unchanged).
+    Run DGSM-CDKM.
 
-    Init only:
-      init_method='kpp'      -> classic k-means++
-      init_method='semantic' -> semantic k-means++ (needs attention)
+    Args:
+        data: [n, m] points
+        k: number of clusters (aligned with PSCA's K)
+        max_cd_iters: cap final CD convergence (default 8; enough for token grouping)
+        do_split_merge: if False, skip oversplit/merge (faster CDKM-only mode)
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -367,16 +315,7 @@ def dgsm_cdkm(
     k = int(max(1, min(k, n)))
 
     if init_indices is None:
-        use_semantic = (
-            init_method in ("semantic", "semantic_kpp", "skpp")
-            and attention is not None
-        )
-        if use_semantic:
-            init_indices = semantic_kmeans_plusplus_init(
-                data, k, attention, rng, alpha=alpha
-            )
-        else:
-            init_indices = kmeans_plusplus_init(data, k, rng)
+        init_indices = kmeans_plusplus_init(data, k, rng)
     else:
         init_indices = np.asarray(init_indices, dtype=np.int64)[:k]
 
@@ -550,15 +489,17 @@ def batch_dgsm_cdkm(
     drop_cls: bool = True,
     max_cd_iters: int = 8,
     do_split_merge: bool = True,
-    attention: Optional[torch.Tensor] = None,
-    alpha: float = 1.0,
-    init_method: str = "kpp",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     PSCA-compatible batch wrapper — stays on `features.device`, truly batched.
 
-    attention: optional [B, T_patch] (or [B, T_patch+1] if drop_cls and CLS included);
-               used only when init_method='semantic'.
+    - No GPU↔CPU↔NumPy round-trip for the default path.
+    - Batch dim is handled with batched k-means++ / Lloyd / split-merge
+      (not a Python for-loop calling single-sample clustering B times).
+
+    Returns:
+        soft_scores: [B, T_patch, K]
+        belong_components: [B, T_patch]
     """
     x = torch.sigmoid(features.float())
 
@@ -566,18 +507,8 @@ def batch_dgsm_cdkm(
         if x.shape[1] < 2:
             raise ValueError("features must include CLS + patches when drop_cls=True")
         tokens = x[:, 1:, :]
-        attn = None
-        if attention is not None:
-            attn = attention.float()
-            if attn.shape[-1] == features.shape[1]:
-                attn = attn[:, 1:]
-            elif attn.shape[-1] != tokens.shape[1]:
-                raise ValueError(
-                    f"attention last dim {attn.shape[-1]} incompatible with tokens {tokens.shape[1]}"
-                )
     else:
         tokens = x
-        attn = attention.float() if attention is not None else None
 
     B, T, D = tokens.shape
     k = max(1, min(int(min_components), T))
@@ -587,69 +518,35 @@ def batch_dgsm_cdkm(
         seed=seed,
         max_iters=max_cd_iters,
         do_split_merge=do_split_merge,
-        attention=attn,
-        alpha=alpha,
-        init_method=init_method,
     )
 
 
-def _normalize_attention_torch(attention: torch.Tensor) -> torch.Tensor:
-    """Min-max normalize last dim to [0,1]. attention: [B, N]."""
-    amin = attention.amin(dim=-1, keepdim=True)
-    amax = attention.amax(dim=-1, keepdim=True)
-    return (attention - amin) / (amax - amin + 1e-8)
-
-
-def _batch_kmeans_plusplus(
-    data: torch.Tensor,
-    k: int,
-    seed: int,
-    attention: Optional[torch.Tensor] = None,
-    alpha: float = 1.0,
-    init_method: str = "kpp",
-) -> torch.Tensor:
-    """
-    Batched k-means++ / semantic k-means++.
-    data: [B, N, D] -> centers [B, K, D]
-    attention: optional [B, N]
-    """
+def _batch_kmeans_plusplus(data: torch.Tensor, k: int, seed: int) -> torch.Tensor:
+    """Batched k-means++. data: [B, N, D] -> centers [B, K, D]."""
     B, N, D = data.shape
     device, dtype = data.device, data.dtype
     g = torch.Generator(device=device)
     g.manual_seed(seed)
 
-    use_semantic = (
-        init_method in ("semantic", "semantic_kpp", "skpp")
-        and attention is not None
-    )
-    attn = _normalize_attention_torch(attention.to(device=device, dtype=dtype)) if use_semantic else None
-    alpha = float(alpha)
-
     centers = torch.empty(B, k, D, device=device, dtype=dtype)
-    batch_idx = torch.arange(B, device=device)
-
-    if use_semantic:
-        prob0 = attn + 1e-6
-        prob0 = prob0 / prob0.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        first = torch.multinomial(prob0, num_samples=1, generator=g).squeeze(-1)
-    else:
-        first = torch.randint(0, N, (B,), generator=g, device=device)
-    centers[:, 0] = data[batch_idx, first]
+    # first center: one random index per batch item
+    first = torch.randint(0, N, (B,), generator=g, device=device)
+    centers[:, 0] = data[torch.arange(B, device=device), first]
 
     closest = torch.full((B, N), float("inf"), device=device, dtype=dtype)
+    batch_idx = torch.arange(B, device=device)
 
     for c in range(1, k):
-        last = centers[:, c - 1 : c]
-        dist_sq = ((data - last) ** 2).sum(dim=-1)
+        # dist to last chosen center
+        last = centers[:, c - 1 : c]  # [B,1,D]
+        dist_sq = ((data - last) ** 2).sum(dim=-1)  # [B,N]
         closest = torch.minimum(closest, dist_sq)
-        if use_semantic:
-            score = closest * (1.0 + alpha * attn)
-        else:
-            score = closest
-        total = score.sum(dim=-1).clamp_min(1e-12)
-        probs = score / total.unsqueeze(-1)
-        choice = torch.multinomial(probs, num_samples=1, generator=g).squeeze(-1)
+        total = closest.sum(dim=-1).clamp_min(1e-12)  # [B]
+        probs = closest / total.unsqueeze(-1)
+        # multinomial sampling per batch row
+        choice = torch.multinomial(probs, num_samples=1, generator=g).squeeze(-1)  # [B]
         centers[:, c] = data[batch_idx, choice]
+        # zero prob mass at chosen points for stability next round (optional)
         closest[batch_idx, choice] = 0.0
 
     return centers
@@ -804,35 +701,26 @@ def _batch_dgsm_torch(
     seed: int = 0,
     max_iters: int = 8,
     do_split_merge: bool = True,
-    attention: Optional[torch.Tensor] = None,
-    alpha: float = 1.0,
-    init_method: str = "kpp",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Device-resident, batched DGSM-style grouping.
     tokens: [B, N, D] on CPU or CUDA — never moved across for clustering itself.
-    Core Lloyd/split-merge unchanged; only initialization can use attention.
     """
     data = tokens.contiguous()
     B, N, D = data.shape
     k = max(1, min(k, N))
 
-    centers = _batch_kmeans_plusplus(
-        data,
-        k,
-        seed,
-        attention=attention,
-        alpha=alpha,
-        init_method=init_method,
-    )
+    centers = _batch_kmeans_plusplus(data, k, seed)
     labels, centers, dists = _batch_lloyd(data, centers, max_iters)
 
     if do_split_merge and k >= 2:
         max_k = max(k, int(1.5 * k))
         live_k = k
+        # oversplit
         while live_k < max_k:
             labels, centers, live_k = _batch_split_once(data, labels, centers, live_k)
             labels, centers, dists = _batch_lloyd(data, centers[:, :live_k], 2)
+        # merge back
         if live_k > k:
             labels, centers = _batch_merge_to_k(data, labels, centers, live_k, k)
             labels, centers, dists = _batch_lloyd(data, centers, max_iters)

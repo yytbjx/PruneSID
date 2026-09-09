@@ -50,27 +50,13 @@ def batch_pca(features, min_components=32):
     return V, belong_components
 
 
-def group_tokens(
-    features,
-    min_components=32,
-    group_method="dgsm",
-    attention=None,
-    init_method="kpp",
-    init_alpha=1.0,
-):
+def group_tokens(features, min_components=32, group_method="dgsm"):
     """Stage-1 grouping: PSCA (pca) or DGSM-CDKM (dgsm). K matches PSCA (= need_token_num/4)."""
     if group_method in (None, "psca", "pca"):
         return batch_pca(features, min_components=min_components)
     if group_method in ("dgsm", "dgsm_cdkm", "cdkm"):
         from prunesid.clustering import batch_dgsm_cdkm
-        return batch_dgsm_cdkm(
-            features,
-            min_components=min_components,
-            drop_cls=True,
-            attention=attention,
-            alpha=init_alpha,
-            init_method=init_method,
-        )
+        return batch_dgsm_cdkm(features, min_components=min_components, drop_cls=True)
     raise ValueError(f"Unknown group_method={group_method!r}; use 'psca' or 'dgsm'")
 
 
@@ -93,23 +79,15 @@ class CLIPVisionTower_PruneSID(nn.Module):
 
             need_token_num = self.need_token_num if self.need_token_num else 192
             group_method = getattr(self, "group_method", "dgsm")
-            init_method = getattr(self, "init_method", "kpp")
-            init_alpha = float(getattr(self, "init_alpha", 1.0))
-
-            # CLS→patch attention (same signal used later for NMS scores)
-            cls_idx = 0
-            cls_attention = attn_weights[:, :, cls_idx, cls_idx + 1 :]
-            cls_attention_sum = cls_attention.sum(dim=1)  # [batch_size, 576]
-
             # K aligned with PSCA: need_token_num / 4
             projector_lengths, belong_components = group_tokens(
                 hidden_states,
                 min_components=int(need_token_num / 4),
                 group_method=group_method,
-                attention=cls_attention_sum,
-                init_method=init_method,
-                init_alpha=init_alpha,
             ) # [batch_size, 576, group_num], [batch_size, 576]
+            cls_idx = 0
+            cls_attention = attn_weights[:, :, cls_idx, cls_idx + 1 :]
+            cls_attention_sum = cls_attention.sum(dim=1) # [batch_size, 576]
             projector_scores = cls_attention_sum.unsqueeze(-1).repeat(1,1, projector_lengths.shape[-1]).to(projector_lengths.dtype) # [batch_size, 576, group_num]
             projector_mask = belong_components.unsqueeze(-1).repeat(1,1, projector_lengths.shape[-1])
             index_map = torch.arange(projector_lengths.shape[-1], device=projector_lengths.device).unsqueeze(0).unsqueeze(0).repeat(projector_lengths.shape[0],projector_lengths.shape[1],1)
