@@ -18,6 +18,33 @@ def pca_group(features, min_components=32):
     belong_components = torch.argmax(V, dim=1)
     return V, belong_components
 
+
+def group_tokens_qwen(
+    features,
+    min_components=32,
+    group_method="dgsm",
+    attention=None,
+    init_method="kpp",
+    init_alpha=1.0,
+):
+    """Stage-1 grouping for Qwen2-VL tokens [T, D]."""
+    if group_method in (None, "psca", "pca"):
+        return pca_group(features, min_components=min_components)
+    if group_method in ("dgsm", "dgsm_cdkm", "cdkm"):
+        from prunesid.clustering import batch_dgsm_cdkm
+        # batch API expects [B, T, D]
+        soft, belong = batch_dgsm_cdkm(
+            features.unsqueeze(0),
+            min_components=min_components,
+            drop_cls=False,
+            attention=None if attention is None else attention.unsqueeze(0),
+            alpha=init_alpha,
+            init_method=init_method,
+        )
+        return soft[0], belong[0]
+    raise ValueError(f"Unknown group_method={group_method!r}; use 'psca' or 'dgsm'")
+
+
 def nms(similarity_matrix, scores, threshold):
     keep = []
     while scores.sum() > 0:
@@ -48,7 +75,18 @@ class Qwen2VisionTransformerPretrainedModel_prunesid(Qwen2VLPreTrainedModel):
         need_token_num = max(round(hidden_states.shape[0] * need_token_num / 576), 16)
         if hidden_states.shape[0] <= 16:
             return hidden_states, None
-        projector_lengths, belong_components = pca_group(hidden_states, min_components=max(int(need_token_num / 4), 4))
+        group_method = getattr(self, "group_method", "dgsm")
+        init_method = getattr(self, "init_method", "kpp")
+        init_alpha = float(getattr(self, "init_alpha", 1.0))
+        # Qwen path has no CLS attention here; semantic init falls back to kpp unless attention is provided later.
+        projector_lengths, belong_components = group_tokens_qwen(
+            hidden_states,
+            min_components=max(int(need_token_num / 4), 4),
+            group_method=group_method,
+            attention=None,
+            init_method=init_method,
+            init_alpha=init_alpha,
+        )
         projector_scores = projector_lengths.clone()
 
         projector_mask = belong_components.unsqueeze(1).repeat(1, projector_lengths.shape[1])

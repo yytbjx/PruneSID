@@ -268,6 +268,26 @@ def parse_eval_args() -> argparse.Namespace:
     
     parser.add_argument("--plug_in_model", type=str, default="None")
     parser.add_argument("--need_token_num", type=int, default=None)
+    parser.add_argument(
+        "--group_method",
+        type=str,
+        default="dgsm",
+        choices=["dgsm", "dgsm_cdkm", "cdkm", "psca", "pca"],
+        help="Stage-1 token grouping: dgsm (DGSM-CDKM, default) or psca (original PCA grouping). K = need_token_num/4.",
+    )
+    parser.add_argument(
+        "--init_method",
+        type=str,
+        default="kpp",
+        choices=["kpp", "semantic", "semantic_kpp", "skpp"],
+        help="DGSM cluster init: kpp (classic k-means++) or semantic (attention-weighted k-means++).",
+    )
+    parser.add_argument(
+        "--init_alpha",
+        type=float,
+        default=1.0,
+        help="Semantic k-means++ alpha in p_i ∝ D_i^2 (1 + alpha A_i). alpha=0 ≈ geometric only after first center.",
+    )
     args = parser.parse_args()
     return args
 

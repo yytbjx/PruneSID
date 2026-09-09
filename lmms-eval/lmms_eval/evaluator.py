@@ -186,10 +186,28 @@ def simple_evaluate(
 
     if cli_args.plug_in_model == "prunesid_llava":
         from prunesid.prunesid_llava import prunesid_llava
-        lm._model = prunesid_llava(lm._model, cli_args.need_token_num)
+        group_method = getattr(cli_args, "group_method", "dgsm")
+        init_method = getattr(cli_args, "init_method", "kpp")
+        init_alpha = getattr(cli_args, "init_alpha", 1.0)
+        lm._model = prunesid_llava(
+            lm._model,
+            cli_args.need_token_num,
+            group_method=group_method,
+            init_method=init_method,
+            init_alpha=init_alpha,
+        )
     elif cli_args.plug_in_model == "prunesid_qwen2":
         from prunesid.prunesid_qwen import prunesid_qwen2
-        lm._model = prunesid_qwen2(lm._model, cli_args.need_token_num)
+        group_method = getattr(cli_args, "group_method", "dgsm")
+        init_method = getattr(cli_args, "init_method", "kpp")
+        init_alpha = getattr(cli_args, "init_alpha", 1.0)
+        lm._model = prunesid_qwen2(
+            lm._model,
+            cli_args.need_token_num,
+            group_method=group_method,
+            init_method=init_method,
+            init_alpha=init_alpha,
+        )
     # helper function to recursively apply config overrides to leaf subtasks, skipping their constituent groups.
     # (setting of num_fewshot ; bypassing metric calculation ; setting fewshot seed)
     def _adjust_config(task_dict):

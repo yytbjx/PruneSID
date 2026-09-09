@@ -1,7 +1,13 @@
 from .clip_encoder import CLIPVisionTower_PruneSID
 from .llava_arch import prepare_inputs_labels_for_multimodal_prunesid, encode_images_prunesid, encode_images_prunesid_multi, restore_image_features_sorted
 
-def prunesid_llava(model, need_token_num=64):
+def prunesid_llava(
+    model,
+    need_token_num=64,
+    group_method="dgsm",
+    init_method="kpp",
+    init_alpha=1.0,
+):
     from llava.model.multimodal_encoder.clip_encoder import CLIPVisionTower
     CLIPVisionTower.forward = CLIPVisionTower_PruneSID.forward
 
@@ -14,4 +20,7 @@ def prunesid_llava(model, need_token_num=64):
         LlavaMetaForCausalLM.encode_images_prunesid_multi = encode_images_prunesid_multi
         LlavaMetaForCausalLM.encode_images_prunesid = encode_images_prunesid
     model.model.vision_tower.need_token_num = need_token_num
+    model.model.vision_tower.group_method = group_method
+    model.model.vision_tower.init_method = init_method
+    model.model.vision_tower.init_alpha = float(init_alpha)
     return model
