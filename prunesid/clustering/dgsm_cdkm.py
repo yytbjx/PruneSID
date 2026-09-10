@@ -1,8 +1,11 @@
 """
 DGSM-CDKM clustering used as a drop-in replacement for PruneSID's PSCA grouping.
 
-Optimized port of DGSM-CDKM.cpp for VLM token grouping (n~576, d~1024, k~16).
-Hot path: vectorized coordinate descent + float32 (original Python loops were ~1s+/image).
+Accuracy-preserving acceleration of the original Python port:
+  - Numba / vectorized coordinate descent (main speedup)
+  - float32 features, float64 decision statistics (temp*, merge, variance)
+  - CD runs until convergence (moved==0), capped by max_cd_iters
+  - batch path calls real DGSM-CDKM (not Lloyd approx)
 """
 
 from __future__ import annotations
@@ -20,11 +23,12 @@ def kmeans_plusplus_init(data: np.ndarray, k: int, rng: np.random.Generator) -> 
     k = min(k, n)
     centers_idx = np.empty(k, dtype=np.int64)
     centers_idx[0] = int(rng.integers(0, n))
-    closest_dist_sq = np.full(n, np.inf, dtype=np.float32)
+    # float64 distances for stable sampling probabilities
+    closest_dist_sq = np.full(n, np.inf, dtype=np.float64)
 
     for c in range(1, k):
         last = data[centers_idx[c - 1]]
-        dist_sq = np.sum((data - last) ** 2, axis=1)
+        dist_sq = np.sum((data.astype(np.float64, copy=False) - last.astype(np.float64)) ** 2, axis=1)
         np.minimum(closest_dist_sq, dist_sq, out=closest_dist_sq)
         total = float(closest_dist_sq.sum())
         if total <= 0 or not np.isfinite(total):
@@ -47,11 +51,13 @@ def _cluster_ave_var_from_F(
 
 
 def _merge_tar_diff(temp0: np.ndarray, temp1: np.ndarray, i: int, j: int) -> float:
-    ti = temp1[i]
-    tj = temp1[j]
+    ti = float(temp1[i])
+    tj = float(temp1[j])
     if ti <= 0 or tj <= 0:
         return -np.inf
-    numerator = -np.sum((temp0[:, i] * tj - temp0[:, j] * ti) ** 2)
+    # decision path: float64
+    t0 = temp0.astype(np.float64, copy=False)
+    numerator = -np.sum((t0[:, i] * tj - t0[:, j] * ti) ** 2)
     denom = ti * tj * (ti + tj)
     return float(numerator / denom)
 
@@ -68,14 +74,15 @@ def _one_cd_numpy(
     """One CD pass (NumPy fallback). Returns #moves."""
     n = data.shape[0]
     moved = 0
+    # Mirror one-hot F; updated in lockstep — equivalent to argmax(F[i]) per point
     labels = np.argmax(F[:, :active_k], axis=1)
 
     for i in range(n):
         p = int(labels[i])
-        np_p = temp1[p]
+        np_p = float(temp1[p])
         if np_p <= 0:
             continue
-        xi = data[i]
+        xi = data[i].astype(np.float64, copy=False)
         xi_sq = float(point_sq[i])
         dots = temp0[:, :active_k].T @ xi
 
@@ -90,7 +97,7 @@ def _one_cd_numpy(
         for j in range(active_k):
             if j == p:
                 continue
-            nj = temp1[j]
+            nj = float(temp1[j])
             if nj <= 0:
                 continue
             m4 = float(temp2[j]) + 2.0 * float(dots[j]) + xi_sq
@@ -142,7 +149,6 @@ def _try_build_numba_one_cd():
                 continue
             xi_sq = point_sq[i]
 
-            # M[p]
             dot_p = 0.0
             for d in range(m):
                 dot_p += data[i, d] * temp0[d, p]
@@ -171,7 +177,6 @@ def _try_build_numba_one_cd():
 
             if best_q != p:
                 q = best_q
-                # old dots for temp2
                 old_dot_p = 0.0
                 old_dot_q = 0.0
                 for d in range(m):
@@ -224,13 +229,14 @@ def _hierarchical_merge_to_two_v2(
     if clu_split_dot_num == 0:
         return
 
-    initial_temp0 = np.zeros((X.shape[1], true_split_clu_num), dtype=np.float32)
-    initial_temp1 = np.zeros(true_split_clu_num, dtype=np.float32)
+    # float64 decision statistics for merge ranking
+    initial_temp0 = np.zeros((X.shape[1], true_split_clu_num), dtype=np.float64)
+    initial_temp1 = np.zeros(true_split_clu_num, dtype=np.float64)
     for j in range(clu_split_dot_num):
         s = int(split_signs[j])
         s = max(0, min(s, true_split_clu_num - 1))
         initial_temp1[s] += 1.0
-        initial_temp0[:, s] += X[split_locs[j]]
+        initial_temp0[:, s] += X[split_locs[j]].astype(np.float64, copy=False)
 
     active = initial_temp1 > 0
     final_cluster_index = np.arange(true_split_clu_num, dtype=np.int64)
@@ -280,8 +286,8 @@ def _hierarchical_merge_to_two_v2(
     else:
         F[split_locs[1], split_clu_no] = 0.0
         F[split_locs[1], new_clu] = 1.0
-        temp0[:, split_clu_no] = X[split_locs[0]]
-        temp0[:, new_clu] = X[split_locs[1]]
+        temp0[:, split_clu_no] = X[split_locs[0]].astype(np.float64, copy=False)
+        temp0[:, new_clu] = X[split_locs[1]].astype(np.float64, copy=False)
         temp1[split_clu_no] = 1.0
         temp1[new_clu] = 1.0
         temp2[split_clu_no] = float(np.dot(temp0[:, split_clu_no], temp0[:, split_clu_no]))
@@ -293,7 +299,7 @@ def dgsm_cdkm(
     k: int,
     init_indices: Optional[np.ndarray] = None,
     rng: Optional[np.random.Generator] = None,
-    max_cd_iters: int = 8,
+    max_cd_iters: int = 100,
     do_split_merge: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -302,57 +308,58 @@ def dgsm_cdkm(
     Args:
         data: [n, m] points
         k: number of clusters (aligned with PSCA's K)
-        max_cd_iters: cap final CD convergence (default 8; enough for token grouping)
+        max_cd_iters: cap on final CD; stops early when a pass moves 0 points
         do_split_merge: if False, skip oversplit/merge (faster CDKM-only mode)
     """
     if rng is None:
         rng = np.random.default_rng(0)
 
-    data = np.ascontiguousarray(data, dtype=np.float32)
-    n, m = data.shape
+    # Features: float32; CD / split-merge state: float64
+    data_f32 = np.ascontiguousarray(data, dtype=np.float32)
+    data64 = np.ascontiguousarray(data_f32, dtype=np.float64)
+    n, m = data64.shape
     if n == 0:
         raise ValueError("empty data")
     k = int(max(1, min(k, n)))
 
     if init_indices is None:
-        init_indices = kmeans_plusplus_init(data, k, rng)
+        init_indices = kmeans_plusplus_init(data_f32, k, rng)
     else:
         init_indices = np.asarray(init_indices, dtype=np.int64)[:k]
 
     max_k = max(k, int(1.5 * k)) if do_split_merge else k
     split_num = min(3, m)
 
-    centers = data[init_indices].copy()
-    # dists via (a-b)^2 = a^2 + b^2 - 2ab
-    data_sq = np.sum(data * data, axis=1, keepdims=True)
+    centers = data64[init_indices].copy()
+    data_sq = np.sum(data64 * data64, axis=1, keepdims=True)
     cen_sq = np.sum(centers * centers, axis=1)
-    dists = data_sq + cen_sq[None, :] - 2.0 * (data @ centers.T)
+    dists = data_sq + cen_sq[None, :] - 2.0 * (data64 @ centers.T)
     for j, idx in enumerate(init_indices):
         dists[idx, :] = np.inf
         dists[idx, j] = 0.0
     labels0 = np.argmin(dists, axis=1)
 
-    F = np.zeros((n, max_k), dtype=np.float32)
+    F = np.zeros((n, max_k), dtype=np.float64)
     F[np.arange(n), labels0] = 1.0
 
-    temp0 = np.zeros((m, max_k), dtype=np.float32)
-    temp1 = np.zeros(max_k, dtype=np.float32)
-    temp2 = np.zeros(max_k, dtype=np.float32)
-    point_sq = np.sum(data * data, axis=1)
+    temp0 = np.zeros((m, max_k), dtype=np.float64)
+    temp1 = np.zeros(max_k, dtype=np.float64)
+    temp2 = np.zeros(max_k, dtype=np.float64)
+    point_sq = np.sum(data64 * data64, axis=1)
 
     for c in range(k):
         members = F[:, c] > 0
         temp1[c] = float(members.sum())
         if temp1[c] > 0:
-            temp0[:, c] = data[members].sum(axis=0)
+            temp0[:, c] = data64[members].sum(axis=0)
             temp2[c] = float(np.dot(temp0[:, c], temp0[:, c]))
 
     for _ in range(2):
-        _one_cd(data, F, temp0, temp1, temp2, point_sq, k)
+        _one_cd(data64, F, temp0, temp1, temp2, point_sq, k)
 
     clu_num = k
     if do_split_merge and max_k > k:
-        clu_ave_var = np.zeros(max_k, dtype=np.float32)
+        clu_ave_var = np.zeros(max_k, dtype=np.float64)
         for c in range(k):
             clu_ave_var[c] = _cluster_ave_var_from_F(F, temp0, temp1, point_sq, c)
 
@@ -376,25 +383,25 @@ def dgsm_cdkm(
                 true_split_clu_num = 2
 
             mean = temp0[:, split_clu_no] / clu_split_dot_num
-            vals = data[split_locs]  # [s, m]
+            vals = data64[split_locs]
             dim_scores = np.abs(vals - mean[None, :]).sum(axis=0)
             chosen_dims = np.argpartition(-dim_scores, true_split_num - 1)[:true_split_num]
 
             split_signs = np.zeros(clu_split_dot_num, dtype=np.int64)
             for dim in chosen_dims:
                 center = mean[dim]
-                ge = data[split_locs, dim] >= center
+                ge = data64[split_locs, dim] >= center
                 split_signs = (split_signs << 1) | ge.astype(np.int64)
 
             _hierarchical_merge_to_two_v2(
-                data, F, temp0, temp1, temp2, split_clu_no, clu_num, split_locs, split_signs, true_split_clu_num
+                data64, F, temp0, temp1, temp2, split_clu_no, clu_num, split_locs, split_signs, true_split_clu_num
             )
             clu_ave_var[split_clu_no] = _cluster_ave_var_from_F(F, temp0, temp1, point_sq, split_clu_no)
             clu_ave_var[clu_num] = _cluster_ave_var_from_F(F, temp0, temp1, point_sq, clu_num)
             clu_num += 1
 
         for _ in range(2):
-            _one_cd(data, F, temp0, temp1, temp2, point_sq, clu_num)
+            _one_cd(data64, F, temp0, temp1, temp2, point_sq, clu_num)
 
         # Merge back to k
         clu_sign = np.ones(clu_num, dtype=np.int64)
@@ -450,36 +457,37 @@ def dgsm_cdkm(
         members = F[:, c] > 0
         temp1[c] = float(members.sum())
         if temp1[c] > 0:
-            temp0[:, c] = data[members].sum(axis=0)
+            temp0[:, c] = data64[members].sum(axis=0)
             temp2[c] = float(np.dot(temp0[:, c], temp0[:, c]))
         else:
             temp0[:, c] = 0.0
             temp2[c] = 0.0
 
+    # Final CD until convergence (same intent as original F_old equality check)
     for _ in range(max_cd_iters):
-        moved = _one_cd(data, F, temp0, temp1, temp2, point_sq, k)
+        moved = _one_cd(data64, F, temp0, temp1, temp2, point_sq, k)
         if moved == 0:
             break
 
     labels = np.argmax(F[:, :k], axis=1).astype(np.int64)
-    centers_out = np.zeros((k, m), dtype=np.float32)
+    centers_out = np.zeros((k, m), dtype=np.float64)
     for c in range(k):
         members = labels == c
         if members.any():
-            centers_out[c] = data[members].mean(axis=0)
+            centers_out[c] = data64[members].mean(axis=0)
         else:
-            centers_out[c] = data[int(rng.integers(0, n))]
+            centers_out[c] = data64[int(rng.integers(0, n))]
 
     cen_sq = np.sum(centers_out * centers_out, axis=1)
-    dists = point_sq[:, None] + cen_sq[None, :] - 2.0 * (data @ centers_out.T)
+    dists = point_sq[:, None] + cen_sq[None, :] - 2.0 * (data64 @ centers_out.T)
     labels = np.argmin(dists, axis=1).astype(np.int64)
     for c in range(k):
         members = labels == c
         if members.any():
-            centers_out[c] = data[members].mean(axis=0)
+            centers_out[c] = data64[members].mean(axis=0)
 
     soft_scores = (-dists).astype(np.float32)
-    return labels, centers_out, soft_scores
+    return labels, centers_out.astype(np.float32), soft_scores
 
 
 def batch_dgsm_cdkm(
@@ -487,21 +495,27 @@ def batch_dgsm_cdkm(
     min_components: int = 32,
     seed: int = 0,
     drop_cls: bool = True,
-    max_cd_iters: int = 8,
+    max_cd_iters: int = 100,
     do_split_merge: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    PSCA-compatible batch wrapper — stays on `features.device`, truly batched.
+    PSCA-compatible batch wrapper — real DGSM-CDKM per sample (Numba-accelerated).
 
-    - No GPU↔CPU↔NumPy round-trip for the default path.
-    - Batch dim is handled with batched k-means++ / Lloyd / split-merge
-      (not a Python for-loop calling single-sample clustering B times).
+    Args:
+        features: [B, T(+1), D] vision tokens (LLaVA includes CLS at index 0)
+        min_components: K, same as PSCA (= need_token_num // 4)
+        seed: RNG seed for k-means++
+        drop_cls: if True, cluster tokens[..., 1:, :] (LLaVA); if False, use all tokens (Qwen)
+        max_cd_iters: final CD iteration cap (early-stops on convergence)
+        do_split_merge: enable DGSM oversplit/merge
 
     Returns:
         soft_scores: [B, T_patch, K]
         belong_components: [B, T_patch]
     """
-    x = torch.sigmoid(features.float())
+    device = features.device
+    dtype = torch.float32
+    x = torch.sigmoid(features.to(dtype))
 
     if drop_cls:
         if x.shape[1] < 2:
@@ -512,218 +526,19 @@ def batch_dgsm_cdkm(
 
     B, T, D = tokens.shape
     k = max(1, min(int(min_components), T))
-    return _batch_dgsm_torch(
-        tokens,
-        k=k,
-        seed=seed,
-        max_iters=max_cd_iters,
-        do_split_merge=do_split_merge,
-    )
 
+    soft_list = []
+    belong_list = []
+    for b in range(B):
+        # Keep feature transfer cheap (float32); dgsm_cdkm promotes decision state to float64
+        data = tokens[b].detach().cpu().numpy().astype(np.float32, copy=False)
+        rng = np.random.default_rng(seed + b)
+        labels, _, soft = dgsm_cdkm(
+            data, k=k, rng=rng, max_cd_iters=max_cd_iters, do_split_merge=do_split_merge
+        )
+        soft_list.append(torch.from_numpy(soft[:, :k]))
+        belong_list.append(torch.from_numpy(labels))
 
-def _batch_kmeans_plusplus(data: torch.Tensor, k: int, seed: int) -> torch.Tensor:
-    """Batched k-means++. data: [B, N, D] -> centers [B, K, D]."""
-    B, N, D = data.shape
-    device, dtype = data.device, data.dtype
-    g = torch.Generator(device=device)
-    g.manual_seed(seed)
-
-    centers = torch.empty(B, k, D, device=device, dtype=dtype)
-    # first center: one random index per batch item
-    first = torch.randint(0, N, (B,), generator=g, device=device)
-    centers[:, 0] = data[torch.arange(B, device=device), first]
-
-    closest = torch.full((B, N), float("inf"), device=device, dtype=dtype)
-    batch_idx = torch.arange(B, device=device)
-
-    for c in range(1, k):
-        # dist to last chosen center
-        last = centers[:, c - 1 : c]  # [B,1,D]
-        dist_sq = ((data - last) ** 2).sum(dim=-1)  # [B,N]
-        closest = torch.minimum(closest, dist_sq)
-        total = closest.sum(dim=-1).clamp_min(1e-12)  # [B]
-        probs = closest / total.unsqueeze(-1)
-        # multinomial sampling per batch row
-        choice = torch.multinomial(probs, num_samples=1, generator=g).squeeze(-1)  # [B]
-        centers[:, c] = data[batch_idx, choice]
-        # zero prob mass at chosen points for stability next round (optional)
-        closest[batch_idx, choice] = 0.0
-
-    return centers
-
-
-def _batch_lloyd(
-    data: torch.Tensor,
-    centers: torch.Tensor,
-    n_iters: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Batched Lloyd iterations.
-    data [B,N,D], centers [B,K,D]
-    returns labels [B,N], centers [B,K,D], dists [B,N,K] (squared L2)
-    """
-    B, N, D = data.shape
-    K = centers.shape[1]
-    for _ in range(max(1, n_iters)):
-        # squared distances via cdist^2
-        dists = torch.cdist(data, centers, p=2).pow(2)  # [B,N,K]
-        labels = dists.argmin(dim=-1)  # [B,N]
-        onehot = torch.nn.functional.one_hot(labels, K).to(dtype=data.dtype)  # [B,N,K]
-        counts = onehot.sum(dim=1).clamp_min(1.0)  # [B,K]
-        new_centers = torch.einsum("bnd,bnk->bkd", data, onehot) / counts.unsqueeze(-1)
-        # keep empty clusters at old location (counts were clamped; detect empties)
-        empty = onehot.sum(dim=1) == 0  # [B,K]
-        if empty.any():
-            new_centers = torch.where(empty.unsqueeze(-1), centers, new_centers)
-        centers = new_centers
-
-    dists = torch.cdist(data, centers, p=2).pow(2)
-    labels = dists.argmin(dim=-1)
-    return labels, centers, dists
-
-
-def _batch_cluster_vars(
-    data: torch.Tensor, labels: torch.Tensor, centers: torch.Tensor, K: int
-) -> torch.Tensor:
-    """Within-cluster sum of squared errors. returns [B,K]."""
-    B, N, D = data.shape
-    assigned = centers[torch.arange(B, device=data.device).unsqueeze(1), labels]  # [B,N,D]
-    sse = ((data - assigned) ** 2).sum(dim=-1)  # [B,N]
-    vars_ = torch.zeros(B, K, device=data.device, dtype=data.dtype)
-    vars_.scatter_add_(1, labels, sse)
-    counts = torch.zeros(B, K, device=data.device, dtype=data.dtype)
-    counts.scatter_add_(1, labels, torch.ones_like(sse))
-    # zero variance for singleton / empty
-    vars_ = torch.where(counts <= 1, torch.zeros_like(vars_), vars_)
-    return vars_
-
-
-def _batch_split_once(
-    data: torch.Tensor,
-    labels: torch.Tensor,
-    centers: torch.Tensor,
-    live_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """
-    Split the highest-variance cluster in each batch item along its max-MAD dimension.
-    Returns labels, centers with shape [B, live_k+1, D], and new live_k.
-    """
-    B, N, D = data.shape
-    device, dtype = data.device, data.dtype
-    vars_ = _batch_cluster_vars(data, labels, centers[:, :live_k], live_k)
-    split_id = vars_.argmax(dim=-1)  # [B]
-    batch_idx = torch.arange(B, device=device)
-
-    split_mask = labels == split_id.unsqueeze(1)  # [B,N]
-    mean = centers[batch_idx, split_id]  # [B,D]
-
-    filled = torch.where(split_mask.unsqueeze(-1), data, mean.unsqueeze(1))
-    mad_sum = ((filled - mean.unsqueeze(1)).abs() * split_mask.unsqueeze(-1).to(dtype)).sum(dim=1)
-    split_dim = mad_sum.argmax(dim=-1)  # [B]
-    thresh = mean[batch_idx, split_dim]  # [B]
-    vals = data[batch_idx[:, None], torch.arange(N, device=device)[None, :], split_dim[:, None]]
-    go_right = (vals >= thresh.unsqueeze(1)) & split_mask
-
-    new_clu = live_k
-    new_labels = torch.where(go_right, torch.full_like(labels, new_clu), labels)
-
-    left_mask = split_mask & ~go_right
-    right_mask = go_right
-    left_counts = left_mask.sum(dim=1).clamp_min(1).unsqueeze(-1).to(dtype)
-    right_counts = right_mask.sum(dim=1).clamp_min(1).unsqueeze(-1).to(dtype)
-    left_c = (data * left_mask.unsqueeze(-1).to(dtype)).sum(dim=1) / left_counts
-    right_c = (data * right_mask.unsqueeze(-1).to(dtype)).sum(dim=1) / right_counts
-
-    new_centers = torch.zeros(B, live_k + 1, D, device=device, dtype=dtype)
-    new_centers[:, :live_k] = centers[:, :live_k]
-    new_centers[batch_idx, split_id] = left_c
-    new_centers[:, new_clu] = right_c
-
-    bad = (left_mask.sum(dim=1) == 0) | (right_mask.sum(dim=1) == 0) | (vars_[batch_idx, split_id] <= 0)
-    if bad.any():
-        new_labels[bad] = labels[bad]
-        new_centers[bad, :live_k] = centers[bad, :live_k]
-        # keep appended column as duplicate of split center so lloyd can absorb it
-        new_centers[bad, new_clu] = centers[bad, split_id[bad]]
-
-    return new_labels, new_centers, live_k + 1
-
-
-def _batch_merge_to_k(
-    data: torch.Tensor,
-    labels: torch.Tensor,
-    centers: torch.Tensor,
-    live_k: int,
-    target_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Greedy merge of nearest centers down to target_k."""
-    B, N, D = data.shape
-    device = data.device
-    dtype = data.dtype
-    cur_k = live_k
-    cur_centers = centers[:, :cur_k].clone()
-    cur_labels = labels.clamp(max=cur_k - 1).clone()
-
-    while cur_k > target_k:
-        d = torch.cdist(cur_centers, cur_centers, p=2).pow(2)
-        eye = torch.eye(cur_k, device=device, dtype=torch.bool).unsqueeze(0)
-        d = d.masked_fill(eye, float("inf"))
-        counts = torch.zeros(B, cur_k, device=device, dtype=dtype)
-        counts.scatter_add_(1, cur_labels, torch.ones(B, N, device=device, dtype=dtype))
-        empty = counts <= 0
-        d = d.masked_fill(empty.unsqueeze(1) | empty.unsqueeze(2), float("inf"))
-
-        min_idx = d.view(B, -1).argmin(dim=-1)
-        i0 = min_idx // cur_k
-        j0 = min_idx % cur_k
-        i = torch.minimum(i0, j0)
-        j = torch.maximum(i0, j0)
-
-        # Vectorized remap: merge j->i then compact ids > j (j differs per batch)
-        # Build mapping table [B, cur_k]
-        arange_k = torch.arange(cur_k, device=device).view(1, -1).expand(B, -1)
-        mapped = torch.where(arange_k == j.unsqueeze(1), i.unsqueeze(1), arange_k)
-        # compact: subtract 1 from ids strictly greater than j
-        mapped = torch.where(mapped > j.unsqueeze(1), mapped - 1, mapped)
-        cur_labels = mapped.gather(1, cur_labels)
-
-        cur_k -= 1
-        onehot = torch.nn.functional.one_hot(cur_labels, cur_k).to(dtype)
-        cnt = onehot.sum(dim=1).clamp_min(1.0)
-        cur_centers = torch.einsum("bnd,bnk->bkd", data, onehot) / cnt.unsqueeze(-1)
-
-    return cur_labels, cur_centers
-
-
-def _batch_dgsm_torch(
-    tokens: torch.Tensor,
-    k: int,
-    seed: int = 0,
-    max_iters: int = 8,
-    do_split_merge: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Device-resident, batched DGSM-style grouping.
-    tokens: [B, N, D] on CPU or CUDA — never moved across for clustering itself.
-    """
-    data = tokens.contiguous()
-    B, N, D = data.shape
-    k = max(1, min(k, N))
-
-    centers = _batch_kmeans_plusplus(data, k, seed)
-    labels, centers, dists = _batch_lloyd(data, centers, max_iters)
-
-    if do_split_merge and k >= 2:
-        max_k = max(k, int(1.5 * k))
-        live_k = k
-        # oversplit
-        while live_k < max_k:
-            labels, centers, live_k = _batch_split_once(data, labels, centers, live_k)
-            labels, centers, dists = _batch_lloyd(data, centers[:, :live_k], 2)
-        # merge back
-        if live_k > k:
-            labels, centers = _batch_merge_to_k(data, labels, centers, live_k, k)
-            labels, centers, dists = _batch_lloyd(data, centers, max_iters)
-
-    soft = (-dists).to(dtype=torch.float32)
-    return soft, labels.long()
+    soft_scores = torch.stack(soft_list, dim=0).to(device=device, dtype=dtype)
+    belong = torch.stack(belong_list, dim=0).to(device=device, dtype=torch.long)
+    return soft_scores, belong

@@ -25,25 +25,87 @@ def group_tokens_qwen(features, min_components=32, group_method="dgsm"):
         return pca_group(features, min_components=min_components)
     if group_method in ("dgsm", "dgsm_cdkm", "cdkm"):
         from prunesid.clustering import batch_dgsm_cdkm
-        # batch API expects [B, T, D]
         soft, belong = batch_dgsm_cdkm(
             features.unsqueeze(0),
             min_components=min_components,
             drop_cls=False,
         )
         return soft[0], belong[0]
-    raise ValueError(f"Unknown group_method={group_method!r}; use 'psca' or 'dgsm'")
+    if group_method in ("aism", "cdkm_aism"):
+        from prunesid.clustering import batch_cdkm_aism
+        soft, belong = batch_cdkm_aism(
+            features.unsqueeze(0),
+            min_components=min_components,
+            drop_cls=False,
+            init_mode="kmeans++",
+        )
+        return soft[0], belong[0]
+    if group_method == "dgsm_aism":
+        from prunesid.clustering import batch_cdkm_aism
+        soft, belong = batch_cdkm_aism(
+            features.unsqueeze(0),
+            min_components=min_components,
+            drop_cls=False,
+            init_mode="dgsm",
+        )
+        return soft[0], belong[0]
+    raise ValueError(
+        f"Unknown group_method={group_method!r}; use 'psca', 'dgsm', 'aism', or 'dgsm_aism'"
+    )
 
 
-def nms(similarity_matrix, scores, threshold):
-    keep = []
-    while scores.sum() > 0:
-        max_idx = scores.argmax(axis=0)
-        scores[max_idx] = 0
-        keep.append(max_idx)
-        condition = similarity_matrix[max_idx] > threshold
-        scores[condition] = 0
-    return keep
+def grouped_nms_torch(
+    similarity_matrix,
+    scores,
+    belong_components,
+    threshold,
+    include_nonpositive=False,
+):
+    """
+    GPU equivalent of running the original scalar NMS independently per group.
+
+    For PSCA, only strictly-positive loadings are candidates, exactly matching
+    ``while scores.sum() > 0``.  Distance-based clustering uses signed -d^2
+    scores, so all finite members are valid and suppressed entries are represented
+    by -inf instead of 0.  This preserves their exact argmax ordering.
+    """
+    token_num, group_num = scores.shape
+    device = scores.device
+    group_ids = torch.arange(group_num, device=device)
+    member_mask = belong_components.unsqueeze(1) == group_ids.unsqueeze(0)
+
+    if include_nonpositive:
+        valid = member_mask & torch.isfinite(scores)
+        ranked_scores = scores.masked_fill(~member_mask, float("-inf"))
+    else:
+        valid = member_mask & (scores > 0)
+        # Preserve the original PSCA behavior where non-members are zero.
+        ranked_scores = scores.masked_fill(~member_mask, 0)
+
+    work = scores.masked_fill(~valid, float("-inf"))
+    keep_counts = torch.zeros(group_num, dtype=torch.long, device=device)
+
+    while True:
+        max_values, max_idx = work.max(dim=0)
+        active = torch.isfinite(max_values)
+        if not bool(active.any()):
+            break
+
+        active_groups = group_ids[active]
+        selected = max_idx[active]
+        # Original code assigns N, N-1, ... independently inside every group.
+        rank_values = (token_num - keep_counts[active_groups]).to(scores.dtype)
+        ranked_scores[selected, active_groups] = rank_values
+        keep_counts[active_groups] += 1
+        work[selected, active_groups] = float("-inf")
+
+        sim_rows = similarity_matrix[selected]  # [active_groups, token_num]
+        suppress = sim_rows > threshold
+        suppress_mask = torch.zeros_like(work, dtype=torch.bool)
+        suppress_mask[:, active_groups] = suppress.transpose(0, 1)
+        work.masked_fill_(suppress_mask, float("-inf"))
+
+    return keep_counts, ranked_scores
 
 class Qwen2VisionTransformerPretrainedModel_prunesid(Qwen2VLPreTrainedModel):
     @torch.no_grad()
@@ -71,36 +133,22 @@ class Qwen2VisionTransformerPretrainedModel_prunesid(Qwen2VLPreTrainedModel):
             min_components=max(int(need_token_num / 4), 4),
             group_method=group_method,
         )
-        projector_scores = projector_lengths.clone()
-
         projector_mask = belong_components.unsqueeze(1).repeat(1, projector_lengths.shape[1])
         index_map = torch.arange(projector_lengths.shape[1], device=projector_lengths.device).unsqueeze(0).repeat(projector_lengths.shape[0],1)
-        weights_mask = torch.where(projector_mask != index_map)
-        projector_lengths[weights_mask] = 0
-        projector_scores[weights_mask] = 0
 
         normalized_states = F.normalize(hidden_states, p=2, dim=-1)
-        group_similarity = torch.bmm(normalized_states.unsqueeze(0), normalized_states.T.unsqueeze(0))[0] # [batch_size, 576, 576]
+        group_similarity = torch.bmm(normalized_states.unsqueeze(0), normalized_states.T.unsqueeze(0))[0]
         sim_mean = group_similarity.triu(diagonal=0).mean()
-        group_similarity = group_similarity.to(torch.float32).cpu().numpy()
-        group_idxs = []
 
-        
-        ratio = max(need_token_num / ((hidden_states.shape[0]) / 18),1)
-        given_scores = torch.arange(projector_lengths.shape[0],0,-1, device=projector_lengths.device, dtype=projector_lengths.dtype)
-        for g in range(projector_lengths.shape[1]):
-            group_indices = torch.where(belong_components == g)[0].cpu().numpy()
-            if group_indices.shape[0] == 0:
-                group_idxs.append(np.array([]))
-                continue
-            g_similarity = group_similarity[group_indices, :][ :, group_indices]
-            g_scores = projector_lengths[:,g][group_indices].cpu().numpy()
-            keep_indices = nms(g_similarity, g_scores, float(ratio * sim_mean))
-            keep_indices = group_indices[keep_indices]
-            projector_scores[keep_indices,g] = given_scores[:keep_indices.shape[0]]
-            group_idxs.append(keep_indices)    
-        
-        keep_nms_counts = torch.tensor([group_idxs[i].shape[0] for i in range(len(group_idxs))], device=projector_lengths.device)
+        ratio = max(need_token_num / ((hidden_states.shape[0]) / 18), 1)
+        is_distance_grouping = group_method not in (None, "psca", "pca")
+        keep_nms_counts, projector_scores = grouped_nms_torch(
+            group_similarity.to(torch.float32),
+            projector_lengths,
+            belong_components,
+            ratio * sim_mean,
+            include_nonpositive=is_distance_grouping,
+        )
         group_counts = (projector_mask == index_map).sum(dim=0)
 
  

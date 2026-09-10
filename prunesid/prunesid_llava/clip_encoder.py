@@ -7,39 +7,44 @@ import math
 
 def batch_similarity_nms(similarity_matrix, scores, threshold):
     """
-    similarity_matrix: shape [batch_size, group, N, N]
-    scores: shape [batch_size, N, group]
-    threshold: [batch_size]
+    Batched per-group greedy NMS without materializing [B,K,N,N].
+
+    similarity_matrix: [B, N, N]
+    scores: [B, N, K], already zero outside each token's group
+    threshold: [B]
+
+    This keeps the original greedy order and suppression rule exactly; only the
+    redundant K-fold similarity expansion is removed.
     """
     new_scores = scores.clone()
     return_scores = new_scores.clone()
+    batch_size, N, group = new_scores.shape
+    batch_idx = torch.arange(batch_size, device=new_scores.device).unsqueeze(1).expand(-1, group)
+    group_idx = torch.arange(group, device=new_scores.device).unsqueeze(0).expand(batch_size, -1)
+    keep_counts = torch.zeros(batch_size, group, dtype=torch.long, device=new_scores.device)
     given_score = 1000
-    keep = []
 
-    batch_size, group, N, _ = similarity_matrix.shape
-    threshold = threshold.unsqueeze(1).unsqueeze(2).expand(batch_size, group, N)
-    batch_idx= torch.arange(batch_size, device=new_scores.device).view(-1, 1, 1).expand(-1, group, N)
-    group_idx = torch.arange(group, device=new_scores.device).view(1, -1, 1).expand(batch_size, -1, N)   # [5, 16, 576]
-    col_idx = torch.arange(N, device=new_scores.device).view(1, 1, -1).expand(batch_size, group, -1)     # [5, 16, 576]
-    while new_scores.sum() > 0:
-        max_values, max_idx = new_scores.max(dim=1) # [batch_size, group], [batch_size, group]
-
-        row_idx = max_idx.unsqueeze(-1).expand(-1, -1, N)
-        sim_row = similarity_matrix[batch_idx, group_idx, row_idx, col_idx] # [batch_size, group, N]
-        max_idx[max_values == 0] = -1
-        given_score_indices_0, given_score_indices_2 = torch.where(max_idx!=-1)
-        given_score_indices_1 = max_idx[given_score_indices_0, given_score_indices_2]
-        return_scores[given_score_indices_0, given_score_indices_1, given_score_indices_2] = given_score
-        new_scores[given_score_indices_0, given_score_indices_1, given_score_indices_2] = 0
-        given_score -= 1
-        keep.append(max_idx.unsqueeze(-1))
-
-        condition = sim_row > threshold # [batch_size, group, N]
-        new_scores[condition.transpose(1,2)] = 0
-        if new_scores.sum() == 0:
+    while True:
+        max_values, max_idx = new_scores.max(dim=1)  # [B,K]
+        active = max_values > 0
+        if not bool(active.any()):
             break
-    keep = torch.cat(keep, dim=-1) # [5, 16, ???]
-    return keep, return_scores
+
+        active_b, active_g = torch.where(active)
+        active_token = max_idx[active_b, active_g]
+        return_scores[active_b, active_token, active_g] = given_score
+        new_scores[active_b, active_token, active_g] = 0
+        keep_counts[active_b, active_g] += 1
+        given_score -= 1
+
+        # Gather one similarity row per (batch, group). Scores outside the group
+        # are already zero, so cross-group entries cannot affect the result.
+        sim_rows = similarity_matrix[batch_idx, max_idx]  # [B,K,N]
+        suppress = sim_rows > threshold.view(batch_size, 1, 1)
+        new_scores.masked_fill_(suppress.transpose(1, 2), 0)
+
+    return keep_counts, return_scores
+
     
 
 def batch_pca(features, min_components=32):
@@ -51,13 +56,25 @@ def batch_pca(features, min_components=32):
 
 
 def group_tokens(features, min_components=32, group_method="dgsm"):
-    """Stage-1 grouping: PSCA (pca) or DGSM-CDKM (dgsm). K matches PSCA (= need_token_num/4)."""
+    """Stage-1 grouping with PSCA, DGSM-CDKM, CDKM-AISM, or DGSM+AISM."""
     if group_method in (None, "psca", "pca"):
         return batch_pca(features, min_components=min_components)
     if group_method in ("dgsm", "dgsm_cdkm", "cdkm"):
         from prunesid.clustering import batch_dgsm_cdkm
         return batch_dgsm_cdkm(features, min_components=min_components, drop_cls=True)
-    raise ValueError(f"Unknown group_method={group_method!r}; use 'psca' or 'dgsm'")
+    if group_method in ("aism", "cdkm_aism"):
+        from prunesid.clustering import batch_cdkm_aism
+        return batch_cdkm_aism(
+            features, min_components=min_components, drop_cls=True, init_mode="kmeans++"
+        )
+    if group_method == "dgsm_aism":
+        from prunesid.clustering import batch_cdkm_aism
+        return batch_cdkm_aism(
+            features, min_components=min_components, drop_cls=True, init_mode="dgsm"
+        )
+    raise ValueError(
+        f"Unknown group_method={group_method!r}; use 'psca', 'dgsm', 'aism', or 'dgsm_aism'"
+    )
 
 
 class CLIPVisionTower_PruneSID(nn.Module):
@@ -102,16 +119,9 @@ class CLIPVisionTower_PruneSID(nn.Module):
             ratio = need_token_num / 32
 
             
-            group_similarity = similarity.clone().unsqueeze(1).repeat(1, projector_lengths.shape[-1], 1, 1) # [batch_size, group_num, 576, 576]
-            group_similarity_masks = torch.zeros_like(group_similarity) # [batch_size, group_num, 576, 576]
-            group_index = torch.arange(group_similarity.shape[1], device=group_similarity.device).unsqueeze(0).unsqueeze(-1).repeat(group_similarity.shape[0],1,group_similarity.shape[-2])
-            group_belong_components = belong_components.unsqueeze(1).repeat(1,group_similarity.shape[1],1)
-            group_similarity_masks[group_index==group_belong_components] = 1
-            group_similarity_masks[torch.where(group_similarity_masks.transpose(3,2) == 1)] = 1
-            group_similarity[group_similarity_masks!=1] = 0
-            group_ids, projector_scores = batch_similarity_nms(group_similarity, projector_scores, ratio * sim_mean)
-            group_ids_mask = (group_ids != -1) # [batch_size, group, ???]
-            keep_nms_counts = group_ids_mask.sum(dim=-1) # [batch_size, group]
+            keep_nms_counts, projector_scores = batch_similarity_nms(
+                similarity, projector_scores, ratio * sim_mean
+            )
             group_counts = (projector_mask == index_map).sum(dim=1) # [batch_size, group]
             group_lower_bound = torch.ones_like(group_counts, device=group_counts.device)
             group_lower_bound = torch.min(torch.cat([group_lower_bound.unsqueeze(0), group_counts.unsqueeze(0)], dim=0), dim=0)[0]
@@ -142,15 +152,15 @@ class CLIPVisionTower_PruneSID(nn.Module):
                 group_token_d[need_filling_batch, group_sort_index[need_filling_batch,filling_group[need_filling_batch]]] += filling_num
                 filling_group[need_filling_batch] += 1
             projector_sort_index = torch.argsort(projector_scores, dim=1, descending=True) #[batch_size, 576, group]
-            projector_sort_index = projector_sort_index.transpose(1,2).reshape(-1, group_similarity.shape[-1]) #[batch_size*group, 576]
+            projector_sort_index = projector_sort_index.transpose(1,2).reshape(-1, similarity.shape[-1]) #[batch_size*group, 576]
             group_token_d = group_token_d.reshape(-1)
             important_indices = []
             for i in range(len(group_token_d)):
                 important_indices.append(projector_sort_index[i][:int(group_token_d[i])])
 
-            important_indices = [important_indices[i:i+group_similarity.shape[1]] for i in range(0, len(important_indices), group_similarity.shape[1])]
+            important_indices = [important_indices[i:i+projector_lengths.shape[-1]] for i in range(0, len(important_indices), projector_lengths.shape[-1])]
             for i in range(len(important_indices)):
-                important_indices[i] = torch.cat([torch.tensor([0], device=group_similarity.device), torch.cat(important_indices[i])+1])
+                important_indices[i] = torch.cat([torch.tensor([0], device=similarity.device), torch.cat(important_indices[i])+1])
             batch_indices = torch.stack(important_indices)
             batch_indices_expanded = batch_indices.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1)) 
             batch_hidden_states = torch.gather(hidden_states, dim=1, index=batch_indices_expanded)
