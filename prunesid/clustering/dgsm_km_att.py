@@ -9,7 +9,16 @@ Design:
            → low-importance / redundant clusters merge first;
              high-attention fine detail (OCR / count / position) is protected.
 
-Reuses Exact GPU Lloyd + DGSM oversplit infrastructure from dgsm_kmeans.
+Implementation:
+  Thin preset over ``batch_dgsm_kmeans`` (shared Exact GPU backend).
+
+Batch invariance (same as dgsm_kmeans after the B1/B8 fix):
+  - Deterministic furthest-point KMeans++ (seed-only tie jitter; no shared RNG)
+  - Per-sample Lloyd early-stop (SSE rel < 0.1%)
+  - Deterministic empty-cluster fill (max ||x||^2)
+  - Per-image variance dims; per-image attention normalization
+  → same image features (+ same token_importance) ⇒ same labels for any B / slot.
+
 Does NOT use spatial split bits or SSE×importance split (kept pure SSE).
 
 Requires token_importance (e.g. CLS→patch attention already in the vision forward).
@@ -41,11 +50,11 @@ def batch_dgsm_km_att(
     split_num: int = 3,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    SSE split + attention-aware merge.
+    SSE split + attention-aware merge (batch-invariant via shared Exact backend).
 
     token_importance: [B, N_patches] (or [B, N+1] with CLS). Recommended:
     CLS attention sum already available in PruneSID LLaVA forward.
-    If None, falls back to pure DGSM merge (λ ignored).
+    If None, falls back to pure DGSM merge (λ effectively unused).
     """
     return batch_dgsm_kmeans(
         features,
@@ -60,11 +69,11 @@ def batch_dgsm_km_att(
         final_max_iters=final_max_iters,
         split_num=split_num,
         token_importance=token_importance,
-        # SA recipe:
+        # SA recipe (no spatial / no attention-on-split):
         use_spatial_split=False,
-        split_imp_alpha=0.0,  # pure SSE split
+        split_imp_alpha=0.0,
         merge_imp_lambda=merge_imp_lambda,
-        merge_imp_pair="mean",  # A_ij = (I_i + I_j) / 2
+        merge_imp_pair="mean",
     )
 
 

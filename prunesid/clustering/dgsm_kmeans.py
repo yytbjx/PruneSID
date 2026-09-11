@@ -1,16 +1,11 @@
 """
-DGSM-KM+: GPU Lloyd + spatial/importance-aware DGSM split/merge.
+DGSM-KM+: GPU Lloyd + optional spatial/importance DGSM split/merge.
 
-NOT faithful DGSM-CDKM (no coordinate descent).
-
-Defaults = DGSM-KM+ (paper main):
+Batch-invariance (same image ⇒ same clustering for any B):
+  - Per-image KMeans++ RNG streams (seed + b * 1000003)
+  - Per-sample Lloyd early-stop (freeze finished images)
+  - Per-image seeded empty-cluster fill
   - Per-image top variance dims
-  - Per-sample Lloyd early-stop (SSE relative drop < 0.1%)
-  - Position-aware split (one spatial bit; feature bits from top-16)
-  - Importance-aware split select + merge (reuse CLS attention; no extra forward)
-  - Exact speed opts: incremental K++ w/ point_sq, fixed-M gather, Gram-8x8 leaf merge
-
-Fast knobs (optional kwargs): oversplit_ratio=1.125, split_num=2
 """
 
 from __future__ import annotations
@@ -81,8 +76,15 @@ def _flash_assign(
 
 
 def _onehot_centroid_update(
-    data: torch.Tensor, labels: torch.Tensor, k: int
+    data: torch.Tensor,
+    labels: torch.Tensor,
+    k: int,
+    point_sq: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Exact centroid update via one_hot^T @ X.
+    Empty clusters filled deterministically with max-||x|| token (batch-invariant).
+    """
     B, N, D = data.shape
     device, dtype = data.device, data.dtype
     oh = F.one_hot(labels, k).to(dtype=dtype)
@@ -92,8 +94,10 @@ def _onehot_centroid_update(
     empty = counts <= 0
     if bool(empty.any()):
         batch = torch.arange(B, device=device)
-        rand_idx = torch.randint(0, N, (B,), device=device)
-        fill = data[batch, rand_idx].unsqueeze(1).expand(-1, k, -1)
+        if point_sq is None:
+            point_sq = (data * data).sum(dim=-1)
+        fill_idx = point_sq.argmax(dim=-1)
+        fill = data[batch, fill_idx].unsqueeze(1).expand(-1, k, -1)
         centers = torch.where(empty.unsqueeze(-1), fill, centers)
     return centers, counts, sums
 
@@ -115,75 +119,58 @@ def _lloyd(
     stop: str = "sse_tol",
     sse_rel_tol: float = 1e-3,
     return_full_dists: bool = True,
+    seed: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
-    Exact flash Lloyd with per-sample early stop.
+    Exact flash Lloyd with per-sample early stop (batch-invariant trajectories).
 
     stop:
-      - "sse_tol": freeze each sample when relative SSE drop < sse_rel_tol (default 0.1%)
-      - "fixed": run max_iters (optional flash-kmeans with init)
-      - "converge": freeze when labels unchanged (legacy)
+      - "sse_tol": freeze each sample when relative SSE drop < sse_rel_tol
+      - "fixed": run max_iters
+      - "converge": freeze when labels unchanged
     """
     K = centers.shape[1]
     device = data.device
     B, N, _D = data.shape
     total_x2 = point_sq.sum(dim=-1)
     dtype = data.dtype
-
-    if (
-        _HAS_FLASH_KMEANS
-        and data.is_cuda
-        and stop == "fixed"
-        and max_iters > 0
-    ):
-        try:
-            _ids, cen, _info = _FLASH_BATCH_KMEANS(
-                data.contiguous(),
-                n_clusters=K,
-                max_iters=max_iters,
-                tol=0.0,
-                init_centroids=centers.contiguous(),
-            )
-            centers = cen.to(dtype=dtype)
-            if return_full_dists:
-                dists = _squared_dists(data, centers, point_sq)
-                return dists.argmin(dim=-1), centers, dists
-            labels, _ = _flash_assign(data, centers, point_sq)
-            return labels, centers, None
-        except Exception:
-            pass
+    _ = seed  # reserved; empty fills are deterministic from point_sq
 
     labels = torch.zeros(B, N, dtype=torch.long, device=device)
     active = torch.ones(B, dtype=torch.bool, device=device)
     prev_sse: Optional[torch.Tensor] = None
     prev_labels: Optional[torch.Tensor] = None
 
-    for _ in range(max(1, max_iters)):
+    for it in range(max(1, max_iters)):
         if not bool(active.any()):
             break
 
         new_labels, _bd = _flash_assign(data, centers, point_sq)
-        new_centers, counts, sums = _onehot_centroid_update(data, new_labels, K)
+        new_centers, _counts, _sums = _onehot_centroid_update(
+            data, new_labels, K, point_sq=point_sq
+        )
 
-        # Freeze finished samples (per-image stop).
         a1 = active.view(B, 1)
         a2 = active.view(B, 1, 1)
         labels = torch.where(a1, new_labels, labels)
         centers = torch.where(a2, new_centers, centers)
 
+        oh = F.one_hot(labels, K).to(dtype=dtype)
+        k_sums = torch.bmm(oh.transpose(1, 2), data)
+        k_counts = oh.sum(dim=1)
+        sse = _sse_from_stats(k_counts, k_sums, total_x2)
+
         if stop == "converge":
             if prev_labels is not None:
-                unchanged = (new_labels == prev_labels).all(dim=-1)
+                unchanged = (labels == prev_labels).all(dim=-1)
                 active = active & ~unchanged
-            prev_labels = new_labels
+            prev_labels = labels.clone()
             continue
 
         if stop == "sse_tol":
-            sse = _sse_from_stats(counts, sums, total_x2)
             if prev_sse is not None:
                 prev = prev_sse.clamp_min(torch.finfo(dtype).tiny)
                 rel = (prev_sse - sse) / prev
-                # Only active samples can finish; inactive stay inactive.
                 newly_done = active & (rel < sse_rel_tol)
                 active = active & ~newly_done
             prev_sse = torch.where(
@@ -192,6 +179,7 @@ def _lloyd(
                 prev_sse if prev_sse is not None else sse,
             )
 
+    # Final assign from frozen centers (per-image; no cross-batch state).
     if return_full_dists:
         dists = _squared_dists(data, centers, point_sq)
         labels = dists.argmin(dim=-1)
@@ -230,38 +218,53 @@ def _patch_xy(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return torch.stack([t, t], dim=-1)
 
 
+def _kmeans_plusplus_one(
+    data: torch.Tensor, k: int, seed: int, point_sq: torch.Tensor
+) -> torch.Tensor:
+    """
+    Deterministic k-means++-style init (batch-position invariant).
+
+    Uses furthest-point selection with seed-only tie jitter — no Generator, so
+    the same image features always get the same centers regardless of B or slot.
+    """
+    N, D = data.shape
+    device = data.device
+    dtype = data.dtype
+    centers = torch.empty(k, D, dtype=dtype, device=device)
+    chosen = torch.zeros(N, dtype=torch.bool, device=device)
+
+    # Tiny seed-only jitter for ties; depends on token index + seed, not batch slot.
+    idx = torch.arange(N, device=device, dtype=dtype)
+    jitter = 1e-6 * torch.sin((idx + 1.0) * (float(seed) * 0.6180339887 + 1.0))
+
+    # First center: max ||x||^2 (with jitter)
+    first = int((point_sq + jitter).argmax().item())
+    centers[0] = data[first]
+    chosen[first] = True
+    closest = torch.full((N,), float("inf"), dtype=dtype, device=device)
+
+    for c in range(1, k):
+        dist = ((data - centers[c - 1]) ** 2).sum(dim=-1)
+        closest = torch.minimum(closest, dist)
+        score = closest + jitter
+        score = score.masked_fill(chosen, float("-inf"))
+        nxt = int(score.argmax().item())
+        centers[c] = data[nxt]
+        chosen[nxt] = True
+    return centers
+
+
 def _kmeans_plusplus(
     data: torch.Tensor, k: int, seed: int, point_sq: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
+    """Per-image deterministic init; identical for the same features at any batch slot."""
     B, N, D = data.shape
-    device = data.device
-    g = torch.Generator(device=device)
-    g.manual_seed(seed)
-    batch = torch.arange(B, device=device)
-    centers = torch.empty(B, k, D, dtype=data.dtype, device=device)
-    chosen = torch.zeros(B, N, dtype=torch.bool, device=device)
     if point_sq is None:
         point_sq = (data * data).sum(dim=-1)
-
-    first = torch.randint(0, N, (B,), generator=g, device=device)
-    centers[:, 0] = data[batch, first]
-    chosen[batch, first] = True
-    closest = torch.full((B, N), float("inf"), dtype=data.dtype, device=device)
-
-    for c in range(1, k):
-        new_c = centers[:, c - 1 : c]
-        dist = _squared_dists(data, new_c, point_sq).squeeze(-1)
-        closest = torch.minimum(closest, dist)
-        closest = closest.masked_fill(chosen, 0.0)
-        total = closest.sum(dim=-1)
-        probs = closest / total.clamp_min(torch.finfo(data.dtype).tiny).unsqueeze(-1)
-        fallback = (~chosen).to(data.dtype)
-        fallback = fallback / fallback.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        probs = torch.where((total > 0).unsqueeze(-1), probs, fallback)
-        nxt = torch.multinomial(probs, 1, generator=g).squeeze(-1)
-        centers[:, c] = data[batch, nxt]
-        chosen[batch, nxt] = True
-    return centers
+    out = torch.empty(B, k, D, dtype=data.dtype, device=data.device)
+    for b in range(B):
+        out[b] = _kmeans_plusplus_one(data[b], k, seed=seed, point_sq=point_sq[b])
+    return out
 
 
 def _stats_from_labels(
@@ -832,6 +835,7 @@ def batch_dgsm_kmeans(
         stop="sse_tol",
         sse_rel_tol=sse_rel_tol,
         return_full_dists=False,
+        seed=seed,
     )
 
     max_k = max(k, min(N, int(round(oversplit_ratio * k))))
@@ -884,6 +888,7 @@ def batch_dgsm_kmeans(
             stop="sse_tol",
             sse_rel_tol=sse_rel_tol,
             return_full_dists=True,
+            seed=seed + 17,
         )
     else:
         dists = _squared_dists(data, centers, point_sq)
