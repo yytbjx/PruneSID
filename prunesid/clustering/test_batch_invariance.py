@@ -68,6 +68,39 @@ def test_final_refine_none_keeps_merge_labels():
     assert torch.equal(lab_n1[0], lab_n[0])
 
 
+def test_dgsm_cd_att_smoke():
+    """Early-stop CD + Att merge returns valid [B,N,K] soft and labels."""
+    from prunesid.clustering.dgsm_cd_att import batch_dgsm_cd_att
+    from prunesid.clustering.dgsm_cdkm import cdk_refine_early_stop
+    import numpy as np
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(3)
+    x = torch.randn(2, 577, 32, device=device)
+    imp = torch.rand(2, 576, device=device)
+    soft, lab = batch_dgsm_cd_att(
+        x,
+        min_components=8,
+        seed=5,
+        token_importance=imp,
+        cd_sse_rel_tol=0.05,
+        cd_min_iters=2,
+        cd_max_iters=10,
+    )
+    assert soft.shape == (2, 576, 8)
+    assert lab.shape == (2, 576)
+    assert int(lab.min()) >= 0 and int(lab.max()) < 8
+
+    # Early-stop respects dual condition on a single sample.
+    data = torch.sigmoid(x[0, 1:]).detach().cpu().numpy().astype(np.float32)
+    labels, n_iters, sse = cdk_refine_early_stop(
+        data, k=8, rng=np.random.default_rng(0), sse_rel_tol=0.05, min_cd_iters=2, max_cd_iters=10
+    )
+    assert labels.shape == (576,)
+    assert n_iters >= 2
+    assert sse >= 0.0
+
+
 def test_spatial_nms_far_tokens_not_suppressed():
     import importlib.util
     from pathlib import Path
@@ -111,5 +144,6 @@ if __name__ == "__main__":
     test_dgsm_kmeans_batch_invariant()
     test_dgsm_km_att_batch_invariant()
     test_final_refine_none_keeps_merge_labels()
+    test_dgsm_cd_att_smoke()
     test_spatial_nms_far_tokens_not_suppressed()
     print("ok")

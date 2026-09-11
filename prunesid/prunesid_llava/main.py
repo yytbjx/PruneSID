@@ -10,6 +10,9 @@ def prunesid_llava(
     nms_spatial_radius=None,
     merge_spatial_gamma=0.0,
     merge_cost_normalize=False,
+    cd_sse_rel_tol=0.05,
+    cd_min_iters=2,
+    cd_max_iters=10,
 ):
     from llava.model.multimodal_encoder.clip_encoder import CLIPVisionTower
     CLIPVisionTower.forward = CLIPVisionTower_PruneSID.forward
@@ -29,8 +32,21 @@ def prunesid_llava(
     vt.nms_spatial_radius = nms_spatial_radius
     vt.merge_spatial_gamma = merge_spatial_gamma
     vt.merge_cost_normalize = bool(merge_cost_normalize)
+    vt.cd_sse_rel_tol = float(cd_sse_rel_tol)
+    vt.cd_min_iters = int(cd_min_iters)
+    vt.cd_max_iters = int(cd_max_iters)
     # Compile DGSM/AISM Numba kernels before timed eval (avoids first-batch stall).
-    if group_method in ("dgsm", "dgsm_cdkm", "cdkm", "dgsm_aism", "aism", "cdkm_aism"):
+    if group_method in (
+        "dgsm",
+        "dgsm_cdkm",
+        "cdkm",
+        "dgsm_aism",
+        "aism",
+        "cdkm_aism",
+        "dgsm_cd_att",
+        "cd_att",
+        "cdkm_att",
+    ):
         try:
             from prunesid.clustering.dgsm_cdkm import warmup_dgsm_cdkm
             warmup_dgsm_cdkm(n=64, m=128, k=max(8, int(need_token_num // 4)))

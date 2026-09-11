@@ -4,9 +4,12 @@ from .dgsm_cdkm import (
     kmeans_plusplus_init,
     warmup_dgsm_cdkm,
     _batch_dgsm_torch,
+    batch_cdk_refine_early_stop,
+    cdk_refine_early_stop,
 )
 from .dgsm_kmeans import batch_dgsm_kmeans
 from .dgsm_km_att import batch_dgsm_km_att
+from .dgsm_cd_att import batch_dgsm_cd_att
 from .cdkm_aism import batch_cdkm_aism, cdkm_aism, warmup_cdkm_aism
 
 __all__ = [
@@ -15,8 +18,11 @@ __all__ = [
     "kmeans_plusplus_init",
     "warmup_dgsm_cdkm",
     "_batch_dgsm_torch",
+    "batch_cdk_refine_early_stop",
+    "cdk_refine_early_stop",
     "batch_dgsm_kmeans",
     "batch_dgsm_km_att",
+    "batch_dgsm_cd_att",
     "batch_cdkm_aism",
     "cdkm_aism",
     "warmup_cdkm_aism",

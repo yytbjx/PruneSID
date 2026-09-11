@@ -108,6 +108,9 @@ def group_tokens(
     final_refine="lloyd",
     merge_spatial_gamma=0.0,
     merge_cost_normalize=False,
+    cd_sse_rel_tol=0.05,
+    cd_min_iters=2,
+    cd_max_iters=10,
 ):
     """Stage-1 grouping: psca / dgsm (CDKM) / dgsm_kmeans (GPU Lloyd) / aism."""
     if group_method in (None, "psca", "pca"):
@@ -137,6 +140,19 @@ def group_tokens(
             merge_spatial_gamma=merge_spatial_gamma,
             merge_cost_normalize=merge_cost_normalize,
         )
+    if group_method in ("dgsm_cd_att", "cd_att", "cdkm_att"):
+        from prunesid.clustering import batch_dgsm_cd_att
+        return batch_dgsm_cd_att(
+            features,
+            min_components=min_components,
+            drop_cls=True,
+            token_importance=token_importance,
+            cd_sse_rel_tol=cd_sse_rel_tol,
+            cd_min_iters=cd_min_iters,
+            cd_max_iters=cd_max_iters,
+            merge_spatial_gamma=merge_spatial_gamma,
+            merge_cost_normalize=merge_cost_normalize,
+        )
     if group_method in ("aism", "cdkm_aism"):
         from prunesid.clustering import batch_cdkm_aism
         return batch_cdkm_aism(
@@ -149,7 +165,8 @@ def group_tokens(
         )
     raise ValueError(
         f"Unknown group_method={group_method!r}; "
-        f"use 'psca', 'dgsm', 'dgsm_kmeans', 'dgsm_km_att', 'aism', or 'dgsm_aism'"
+        f"use 'psca', 'dgsm', 'dgsm_kmeans', 'dgsm_km_att', 'dgsm_cd_att', "
+        f"'aism', or 'dgsm_aism'"
     )
 
 
@@ -190,6 +207,9 @@ class CLIPVisionTower_PruneSID(nn.Module):
             final_refine = getattr(self, "final_refine", "lloyd")
             merge_spatial_gamma = float(getattr(self, "merge_spatial_gamma", 0.0) or 0.0)
             merge_cost_normalize = bool(getattr(self, "merge_cost_normalize", False))
+            cd_sse_rel_tol = float(getattr(self, "cd_sse_rel_tol", 0.05) or 0.05)
+            cd_min_iters = int(getattr(self, "cd_min_iters", 2) or 2)
+            cd_max_iters = int(getattr(self, "cd_max_iters", 10) or 10)
             # Reuse CLS→patch attention already computed in this forward (no extra pass).
             cls_idx = 0
             cls_attention = attn_weights[:, :, cls_idx, cls_idx + 1 :]
@@ -204,6 +224,9 @@ class CLIPVisionTower_PruneSID(nn.Module):
                 final_refine=final_refine,
                 merge_spatial_gamma=merge_spatial_gamma,
                 merge_cost_normalize=merge_cost_normalize,
+                cd_sse_rel_tol=cd_sse_rel_tol,
+                cd_min_iters=cd_min_iters,
+                cd_max_iters=cd_max_iters,
             )  # [B, 576, K], [B, 576]
             projector_scores = cls_attention_sum.unsqueeze(-1).repeat(
                 1, 1, projector_lengths.shape[-1]

@@ -966,6 +966,7 @@ def batch_dgsm_kmeans(
     merge_cost_normalize: bool = False,
     final_refine: str = "lloyd",
     debug_merge_attn: bool = False,
+    init_labels: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     DGSM-KM+ clustering.
@@ -980,6 +981,8 @@ def batch_dgsm_kmeans(
       - "lloyd": final Euclidean Lloyd after merge (default baseline)
       - "none": keep merge labels; still compute soft scores from merge centers
                 (ablation: does final Lloyd undo attention/spatial protection?)
+
+    init_labels: optional [B, N_patches] to skip KMeans++/Lloyd (e.g. CD early-stop).
     """
     if final_refine not in ("lloyd", "none"):
         raise ValueError(f"final_refine must be 'lloyd' or 'none', got {final_refine!r}")
@@ -1018,17 +1021,30 @@ def batch_dgsm_kmeans(
     )
     xy = _patch_xy(N, data.device, data.dtype) if need_xy else None
 
-    centers = _kmeans_plusplus(data, k, seed, point_sq=point_sq)
-    labels, centers, _ = _lloyd(
-        data,
-        centers,
-        max_lloyd_iters,
-        point_sq,
-        stop="sse_tol",
-        sse_rel_tol=sse_rel_tol,
-        return_full_dists=False,
-        seed=seed,
-    )
+    if init_labels is not None:
+        labels = init_labels.to(device=data.device, dtype=torch.long)
+        if labels.ndim == 1:
+            labels = labels.unsqueeze(0)
+        if labels.shape != (B, N):
+            raise ValueError(
+                f"init_labels shape {tuple(labels.shape)} != expected {(B, N)}"
+            )
+        labels = labels.clamp(0, k - 1).contiguous()
+        centers, _counts, _sums = _onehot_centroid_update(
+            data, labels, k, point_sq=point_sq
+        )
+    else:
+        centers = _kmeans_plusplus(data, k, seed, point_sq=point_sq)
+        labels, centers, _ = _lloyd(
+            data,
+            centers,
+            max_lloyd_iters,
+            point_sq,
+            stop="sse_tol",
+            sse_rel_tol=sse_rel_tol,
+            return_full_dists=False,
+            seed=seed,
+        )
 
     max_k = max(k, min(N, int(round(oversplit_ratio * k))))
     dists: Optional[torch.Tensor] = None
@@ -1096,7 +1112,9 @@ def batch_dgsm_kmeans(
             )
     else:
         dists = _squared_dists(data, centers, point_sq)
-        labels = dists.argmin(dim=-1)
+        if init_labels is None:
+            labels = dists.argmin(dim=-1)
+        # else: keep CD / provided labels; soft from current centers
 
     soft = (-dists).to(torch.float32)
     return soft, labels

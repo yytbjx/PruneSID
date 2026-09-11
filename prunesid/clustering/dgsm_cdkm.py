@@ -82,6 +82,210 @@ def _sync_stats_from_F(data64, F, temp0, temp1, temp2, k) -> None:
             temp2[c] = 0.0
 
 
+def _sse_from_cd_stats(
+    temp1: np.ndarray, temp2: np.ndarray, point_sq: np.ndarray, k: int
+) -> float:
+    """SSE = Σ||x||² - Σ_c ||S_c||² / n_c."""
+    total = float(point_sq.sum())
+    term = 0.0
+    for c in range(k):
+        n_c = float(temp1[c])
+        if n_c > 0.0:
+            term += float(temp2[c]) / n_c
+    return max(0.0, total - term)
+
+
+def cdk_refine_early_stop(
+    data: np.ndarray,
+    k: int,
+    init_indices: Optional[np.ndarray] = None,
+    rng: Optional[np.random.Generator] = None,
+    *,
+    sse_rel_tol: float = 0.05,
+    min_cd_iters: int = 2,
+    max_cd_iters: int = 10,
+) -> Tuple[np.ndarray, int, float]:
+    """
+    CD-only structure refinement (no split/merge, no final argmin).
+
+    Pipeline:
+      k-means++ → assign → coordinate descent until
+        (iter >= min_cd_iters) and (ΔSSE / SSE_prev < sse_rel_tol)
+      or moved==0, or max_cd_iters.
+
+    Returns:
+      labels [N], n_iters used, final SSE
+    """
+    if not _nb._HAS_NUMBA:
+        raise RuntimeError(
+            "DGSM-CDKM requires numba. Install numba or use --group_method psca."
+        )
+    _ensure_warm()
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    data_f32 = np.ascontiguousarray(data, dtype=np.float32)
+    data64 = np.ascontiguousarray(data_f32, dtype=np.float64)
+    n, m = data64.shape
+    if n == 0:
+        raise ValueError("empty data")
+    k = int(max(1, min(k, n)))
+    min_cd_iters = max(1, int(min_cd_iters))
+    max_cd_iters = max(min_cd_iters, int(max_cd_iters))
+    sse_rel_tol = float(sse_rel_tol)
+
+    if init_indices is None:
+        init_indices = kmeans_plusplus_init(data_f32, k, rng)
+    else:
+        init_indices = np.asarray(init_indices, dtype=np.int64)[:k]
+
+    centers = data64[init_indices]
+    point_sq = np.sum(data64 * data64, axis=1)
+    cen_sq = np.sum(centers * centers, axis=1)
+    dists = point_sq[:, None] + cen_sq[None, :] - 2.0 * (data64 @ centers.T)
+    for j, idx in enumerate(init_indices):
+        dists[idx, :] = np.inf
+        dists[idx, j] = 0.0
+    labels0 = np.argmin(dists, axis=1)
+
+    F = np.zeros((n, k), dtype=np.float64)
+    F[np.arange(n), labels0] = 1.0
+    temp0 = np.zeros((m, k), dtype=np.float64)
+    temp1 = np.zeros(k, dtype=np.float64)
+    temp2 = np.zeros(k, dtype=np.float64)
+    _sync_stats_from_F(data64, F, temp0, temp1, temp2, k)
+
+    prev_sse = _sse_from_cd_stats(temp1, temp2, point_sq, k)
+    n_iters = 0
+    for it in range(1, max_cd_iters + 1):
+        moved = int(_nb.one_cd(data64, F, temp0, temp1, temp2, point_sq, k))
+        n_iters = it
+        sse = _sse_from_cd_stats(temp1, temp2, point_sq, k)
+        if prev_sse > 0.0:
+            gain = (prev_sse - sse) / prev_sse
+        else:
+            gain = 0.0
+        # Dual stop: enough iters AND relative SSE gain below α (or converged).
+        if it >= min_cd_iters and (gain < sse_rel_tol or moved == 0):
+            prev_sse = sse
+            break
+        if moved == 0 and it >= min_cd_iters:
+            prev_sse = sse
+            break
+        prev_sse = sse
+
+    labels = np.argmax(F[:, :k], axis=1).astype(np.int64)
+    return labels, n_iters, float(prev_sse)
+
+
+def _cdk_refine_one_sample(
+    data_f32: np.ndarray,
+    k: int,
+    seed: int,
+    sse_rel_tol: float,
+    min_cd_iters: int,
+    max_cd_iters: int,
+) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    labels, _, _ = cdk_refine_early_stop(
+        data_f32,
+        k=k,
+        rng=rng,
+        sse_rel_tol=sse_rel_tol,
+        min_cd_iters=min_cd_iters,
+        max_cd_iters=max_cd_iters,
+    )
+    return labels
+
+
+def batch_cdk_refine_early_stop(
+    features: torch.Tensor,
+    min_components: int = 32,
+    seed: int = 0,
+    drop_cls: bool = True,
+    *,
+    sse_rel_tol: float = 0.05,
+    min_cd_iters: int = 2,
+    max_cd_iters: int = 10,
+) -> torch.Tensor:
+    """
+    Batch CD-only early-stop refine. Returns labels [B, T_patch].
+
+    No split/merge and no final Euclidean reassignment — intended as the
+    structure stage before SSE-split + attention-merge.
+    """
+    if not _nb._HAS_NUMBA:
+        raise RuntimeError(
+            "DGSM-CDKM requires numba. Install numba or use --group_method psca."
+        )
+    _ensure_warm()
+
+    device = features.device
+    dtype = torch.float32
+    x = torch.sigmoid(features.to(dtype))
+    if drop_cls:
+        if x.shape[1] < 2:
+            raise ValueError("features must include CLS + patches when drop_cls=True")
+        tokens = x[:, 1:, :]
+    else:
+        tokens = x
+
+    B, T, _D = tokens.shape
+    k = max(1, min(int(min_components), T))
+    tokens_np = np.ascontiguousarray(
+        tokens.detach().to(dtype=torch.float32).cpu().numpy(), dtype=np.float32
+    )
+
+    prev_numba_threads = None
+    try:
+        from numba import get_num_threads, set_num_threads
+
+        prev_numba_threads = get_num_threads()
+        set_num_threads(1)
+    except Exception:
+        set_num_threads = None  # type: ignore
+
+    max_workers = int(os.environ.get("DGSM_BATCH_WORKERS", "0"))
+    if max_workers <= 0:
+        max_workers = min(B, max(1, min(4, (os.cpu_count() or 4) // 2)))
+
+    belong_list = [None] * B
+    try:
+        if B == 1 or max_workers == 1:
+            for b in range(B):
+                belong_list[b] = _cdk_refine_one_sample(
+                    tokens_np[b],
+                    k,
+                    seed + b,
+                    sse_rel_tol,
+                    min_cd_iters,
+                    max_cd_iters,
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = {
+                    ex.submit(
+                        _cdk_refine_one_sample,
+                        tokens_np[b],
+                        k,
+                        seed + b,
+                        sse_rel_tol,
+                        min_cd_iters,
+                        max_cd_iters,
+                    ): b
+                    for b in range(B)
+                }
+                for fut, b in futs.items():
+                    belong_list[b] = fut.result()
+    finally:
+        if set_num_threads is not None and prev_numba_threads is not None:
+            set_num_threads(prev_numba_threads)
+
+    return torch.from_numpy(np.stack(belong_list, axis=0)).to(
+        device=device, dtype=torch.long, non_blocking=True
+    )
+
+
 def dgsm_cdkm(
     data: np.ndarray,
     k: int,
@@ -371,4 +575,6 @@ __all__ = [
     "kmeans_plusplus_init",
     "warmup_dgsm_cdkm",
     "_batch_dgsm_torch",
+    "cdk_refine_early_stop",
+    "batch_cdk_refine_early_stop",
 ]

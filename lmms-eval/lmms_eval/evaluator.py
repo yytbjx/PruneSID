@@ -195,6 +195,9 @@ def simple_evaluate(
             nms_spatial_radius=getattr(cli_args, "nms_spatial_radius", None),
             merge_spatial_gamma=float(getattr(cli_args, "merge_spatial_gamma", 0.0) or 0.0),
             merge_cost_normalize=bool(getattr(cli_args, "merge_cost_normalize", False)),
+            cd_sse_rel_tol=float(getattr(cli_args, "cd_sse_rel_tol", 0.05) or 0.05),
+            cd_min_iters=int(getattr(cli_args, "cd_min_iters", 2) or 2),
+            cd_max_iters=int(getattr(cli_args, "cd_max_iters", 10) or 10),
         )
     elif cli_args.plug_in_model == "prunesid_qwen2":
         from prunesid.prunesid_qwen import prunesid_qwen2

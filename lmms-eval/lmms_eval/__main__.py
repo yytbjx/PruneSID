@@ -282,6 +282,9 @@ def parse_eval_args() -> argparse.Namespace:
             "dgsm_km_att",
             "dgsm_att",
             "km_att",
+            "dgsm_cd_att",
+            "cd_att",
+            "cdkm_att",
             "aism",
             "cdkm_aism",
             "dgsm_aism",
@@ -292,7 +295,8 @@ def parse_eval_args() -> argparse.Namespace:
             "Stage-1 token grouping. "
             "dgsm=faithful DGSM-CDKM (CPU Numba lossless); "
             "dgsm_kmeans=GPU Lloyd + DGSM S/M; "
-            "dgsm_km_att=SSE split + attention-aware merge (reuses CLS attn); "
+            "dgsm_km_att=Lloyd + SSE split + attention merge; "
+            "dgsm_cd_att=early-stop CD + SSE split + attention merge (no final CD); "
             "psca=original PCA grouping. K = need_token_num/4."
         ),
     )
@@ -303,7 +307,8 @@ def parse_eval_args() -> argparse.Namespace:
         choices=["lloyd", "none"],
         help=(
             "After split/merge: 'lloyd' runs final Euclidean Lloyd (baseline); "
-            "'none' keeps merge labels (V1 ablation)."
+            "'none' keeps merge labels (V1 ablation). Ignored by dgsm_cd_att "
+            "(always stops after attention merge)."
         ),
     )
     parser.add_argument(
@@ -328,6 +333,27 @@ def parse_eval_args() -> argparse.Namespace:
         "--merge_cost_normalize",
         action="store_true",
         help="V3: per-image normalize SSE/attention before adding spatial merge term.",
+    )
+    parser.add_argument(
+        "--cd_sse_rel_tol",
+        type=float,
+        default=0.05,
+        help=(
+            "dgsm_cd_att: stop CD when ΔSSE/SSE_prev < this and iter>=cd_min_iters "
+            "(default 0.05)."
+        ),
+    )
+    parser.add_argument(
+        "--cd_min_iters",
+        type=int,
+        default=2,
+        help="dgsm_cd_att: minimum CD iterations before early stop (default 2).",
+    )
+    parser.add_argument(
+        "--cd_max_iters",
+        type=int,
+        default=10,
+        help="dgsm_cd_att: maximum CD iterations (default 10).",
     )
     args = parser.parse_args()
     return args
