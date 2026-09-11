@@ -7,6 +7,7 @@ import torch
 from prunesid.clustering.dgsm_kmeans import (
     _gram_merge_pair,
     _kmeans_plusplus,
+    _per_image_top_variance_dims,
     batch_dgsm_kmeans,
 )
 
@@ -33,6 +34,18 @@ def test_kpp_incremental_runs():
     assert c.shape == (2, 8, 32)
 
 
+def test_per_image_variance_dims():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    data = torch.zeros(2, 32, 16, device=device)
+    data[0, :, 0] = torch.linspace(-1, 1, 32, device=device)
+    data[1, :, 7] = torch.linspace(-1, 1, 32, device=device)
+    dims = _per_image_top_variance_dims(data, n_dims=4)
+    assert dims.shape == (2, 4)
+    assert int(dims[0, 0].item()) == 0
+    assert int(dims[1, 0].item()) == 7
+
+
 def test_batch_dgsm_kmeans_deterministic():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     x = torch.randn(1, 577, 128, device=device)
@@ -43,8 +56,18 @@ def test_batch_dgsm_kmeans_deterministic():
     assert l1.unique().numel() <= 8
 
 
+def test_batch8_runs():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    x = torch.randn(8, 577, 64, device=device)
+    soft, lab = batch_dgsm_kmeans(x, min_components=8, seed=0)
+    assert soft.shape == (8, 576, 8)
+    assert lab.shape == (8, 576)
+
+
 if __name__ == "__main__":
     test_gram_matches_sst()
     test_kpp_incremental_runs()
+    test_per_image_variance_dims()
     test_batch_dgsm_kmeans_deterministic()
+    test_batch8_runs()
     print("ok")

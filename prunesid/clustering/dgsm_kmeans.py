@@ -15,7 +15,7 @@ Approximation-free implementation optimizations (Algorithm-Exact / E1):
 
 Pipeline (algorithm frozen):
   1) k-means++ + flash Lloyd until relative SSE gain < 10%
-  2) Oversplit ~1.25K: global top-16 dims, 8-leaf one-pass split
+  2) Oversplit ~1.25K: per-image top-16 variance dims, 8-leaf one-pass split
   3) Merge back to K (Gram incremental)
   4) flash Lloyd to label convergence (capped); soft = -dists
 """
@@ -214,13 +214,22 @@ def _lloyd(
 # ---------------------------------------------------------------------------
 
 
-def _global_top_variance_dims(data: torch.Tensor, n_dims: int = 16) -> torch.Tensor:
-    """Batch-shared top variance dims (same as prior Exact behavior)."""
-    n_dims = min(n_dims, data.shape[-1])
+def _per_image_top_variance_dims(data: torch.Tensor, n_dims: int = 16) -> torch.Tensor:
+    """
+    Per-image top variance dims. Returns [B, n_dims].
+
+    Avoids batch-mean coupling where one image's split dims depend on siblings
+    in the same micro-batch (near-zero extra cost vs shared top-16).
+    """
+    B, _N, D = data.shape
+    n_dims = min(n_dims, D)
     mean = data.mean(dim=1, keepdim=True)
     var = ((data - mean) ** 2).mean(dim=1)  # [B,D]
-    var_mean = var.mean(dim=0)
-    return torch.argsort(var_mean, descending=True, stable=True)[:n_dims]
+    return torch.argsort(var, dim=-1, descending=True, stable=True)[:, :n_dims]
+
+
+# Back-compat alias (now per-image, not batch-shared).
+_global_top_variance_dims = _per_image_top_variance_dims
 
 
 def _kmeans_plusplus(data: torch.Tensor, k: int, seed: int) -> torch.Tensor:
@@ -393,7 +402,10 @@ def _eight_leaf_split_packed(
     split_num: int,
     candidate_dims: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """One-pass 8-leaf on packed members; CPU hier merge L->2."""
+    """One-pass 8-leaf on packed members; CPU hier merge L->2.
+
+    candidate_dims: None | [C] shared | [B, C] per-image.
+    """
     B, M, D = packed.shape
     device = packed.device
     dtype = packed.dtype
@@ -405,15 +417,23 @@ def _eight_leaf_split_packed(
         order = torch.argsort(dim_scores, dim=-1, descending=True, stable=True)
         chosen = order[:, :split_num]
     else:
-        C = int(candidate_dims.numel())
-        sub = packed.index_select(2, candidate_dims)
-        mean_sub = mean.index_select(1, candidate_dims)
+        if candidate_dims.ndim == 1:
+            cand = candidate_dims.view(1, -1).expand(B, -1)
+        else:
+            cand = candidate_dims
+        C = cand.shape[1]
+        # Gather per-image candidate coordinates: sub[b,m,c] = packed[b,m,cand[b,c]]
+        b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, M, C)
+        m_idx = torch.arange(M, device=device).view(1, M, 1).expand(B, M, C)
+        d_idx = cand.unsqueeze(1).expand(B, M, C)
+        sub = packed[b_idx, m_idx, d_idx]
+        mean_sub = torch.gather(mean, 1, cand)
         abs_dev = (sub - mean_sub.unsqueeze(1)).abs() * valid.unsqueeze(-1).to(dtype)
-        dim_scores = abs_dev.sum(dim=1)
+        dim_scores = abs_dev.sum(dim=1)  # [B,C]
         order_local = torch.argsort(dim_scores, dim=-1, descending=True, stable=True)
         take = min(split_num, C)
         local = order_local[:, :take]
-        chosen = candidate_dims[local]
+        chosen = torch.gather(cand, 1, local)
         if take < split_num:
             pad = chosen[:, :1].expand(B, split_num - take)
             chosen = torch.cat([chosen, pad], dim=1)
@@ -714,7 +734,7 @@ def batch_dgsm_kmeans(
     dists: Optional[torch.Tensor] = None
     if do_split_merge and max_k > k:
         split_num = min(3, D)
-        cand = _global_top_variance_dims(data, n_dims=min(global_var_dims, D))
+        cand = _per_image_top_variance_dims(data, n_dims=min(global_var_dims, D))
         counts, sums, sum_x2 = _stats_from_labels(data, labels, max_k, point_sq)
         clu_num = k
         while clu_num < max_k:
