@@ -1,11 +1,34 @@
+import math
+import os
+from typing import Optional
+
 import torch
 import torch.nn as nn
-import numpy as np
-import os
 import torch.nn.functional as F
-import math
 
-def batch_similarity_nms(similarity_matrix, scores, threshold):
+
+def _patch_xy_normalized(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Normalized (x,y) in [0,1]^2 for N patches. Square grid when N is a perfect square."""
+    side = int(math.sqrt(n))
+    if side * side == n:
+        yy, xx = torch.meshgrid(
+            torch.arange(side, device=device, dtype=dtype),
+            torch.arange(side, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        denom = max(side - 1, 1)
+        return torch.stack([xx.reshape(-1) / denom, yy.reshape(-1) / denom], dim=-1)
+    t = torch.linspace(0.0, 1.0, n, device=device, dtype=dtype)
+    return torch.stack([t, t], dim=-1)
+
+
+def batch_similarity_nms(
+    similarity_matrix,
+    scores,
+    threshold,
+    spatial_radius=None,
+    token_xy=None,
+):
     """
     Batched per-group greedy NMS without materializing [B,K,N,N].
 
@@ -13,16 +36,34 @@ def batch_similarity_nms(similarity_matrix, scores, threshold):
     scores: [B, N, K], already zero outside each token's group
     threshold: [B]
 
-    This keeps the original greedy order and suppression rule exactly; only the
-    redundant K-fold similarity expansion is removed.
+    spatial_radius / token_xy (optional spatial-constrained NMS):
+      suppress(i,j) = [sim(i,j) > τ] AND [||p_i - p_j||_∞ ≤ r]
+      If spatial_radius is None or +inf, recovers feature-only NMS (baseline).
+      token_xy: [N, 2] normalized patch coordinates in [0,1]^2.
+
+    This keeps the original greedy order and suppression rule exactly when
+    spatial_radius is disabled; only the redundant K-fold similarity expansion
+    is removed.
     """
     new_scores = scores.clone()
     return_scores = new_scores.clone()
     batch_size, N, group = new_scores.shape
     batch_idx = torch.arange(batch_size, device=new_scores.device).unsqueeze(1).expand(-1, group)
-    group_idx = torch.arange(group, device=new_scores.device).unsqueeze(0).expand(batch_size, -1)
     keep_counts = torch.zeros(batch_size, group, dtype=torch.long, device=new_scores.device)
     given_score = 1000
+
+    use_spatial = (
+        spatial_radius is not None
+        and math.isfinite(float(spatial_radius))
+        and token_xy is not None
+    )
+    if use_spatial:
+        token_xy = token_xy.to(device=new_scores.device, dtype=similarity_matrix.dtype)
+        if token_xy.ndim != 2 or token_xy.shape[0] != N or token_xy.shape[1] != 2:
+            raise ValueError(
+                f"token_xy must be [N,2]={N,2}, got {tuple(token_xy.shape)}"
+            )
+        r = float(spatial_radius)
 
     while True:
         max_values, max_idx = new_scores.max(dim=1)  # [B,K]
@@ -41,11 +82,15 @@ def batch_similarity_nms(similarity_matrix, scores, threshold):
         # are already zero, so cross-group entries cannot affect the result.
         sim_rows = similarity_matrix[batch_idx, max_idx]  # [B,K,N]
         suppress = sim_rows > threshold.view(batch_size, 1, 1)
+        if use_spatial:
+            # Chebyshev distance between selected token and all tokens.
+            sel_xy = token_xy[max_idx]  # [B,K,2]
+            cheb = (sel_xy.unsqueeze(2) - token_xy.view(1, 1, N, 2)).abs().amax(dim=-1)
+            suppress = suppress & (cheb <= r)
         new_scores.masked_fill_(suppress.transpose(1, 2), 0)
 
     return keep_counts, return_scores
 
-    
 
 def batch_pca(features, min_components=32):
     standard_features = torch.sigmoid(features.to(torch.float32)).transpose(2,1)[:,:,1:]
@@ -55,7 +100,15 @@ def batch_pca(features, min_components=32):
     return V, belong_components
 
 
-def group_tokens(features, min_components=32, group_method="dgsm", token_importance=None):
+def group_tokens(
+    features,
+    min_components=32,
+    group_method="dgsm",
+    token_importance=None,
+    final_refine="lloyd",
+    merge_spatial_gamma=0.0,
+    merge_cost_normalize=False,
+):
     """Stage-1 grouping: psca / dgsm (CDKM) / dgsm_kmeans (GPU Lloyd) / aism."""
     if group_method in (None, "psca", "pca"):
         return batch_pca(features, min_components=min_components)
@@ -69,6 +122,9 @@ def group_tokens(features, min_components=32, group_method="dgsm", token_importa
             min_components=min_components,
             drop_cls=True,
             token_importance=token_importance,
+            final_refine=final_refine,
+            merge_spatial_gamma=merge_spatial_gamma,
+            merge_cost_normalize=merge_cost_normalize,
         )
     if group_method in ("dgsm_km_att", "dgsm_att", "km_att"):
         from prunesid.clustering import batch_dgsm_km_att
@@ -77,6 +133,9 @@ def group_tokens(features, min_components=32, group_method="dgsm", token_importa
             min_components=min_components,
             drop_cls=True,
             token_importance=token_importance,
+            final_refine=final_refine,
+            merge_spatial_gamma=merge_spatial_gamma,
+            merge_cost_normalize=merge_cost_normalize,
         )
     if group_method in ("aism", "cdkm_aism"):
         from prunesid.clustering import batch_cdkm_aism
@@ -92,6 +151,21 @@ def group_tokens(features, min_components=32, group_method="dgsm", token_importa
         f"Unknown group_method={group_method!r}; "
         f"use 'psca', 'dgsm', 'dgsm_kmeans', 'dgsm_km_att', 'aism', or 'dgsm_aism'"
     )
+
+
+def _resolve_nms_spatial_radius(vision_tower) -> Optional[float]:
+    """None / +inf → feature-only NMS baseline."""
+    r = getattr(vision_tower, "nms_spatial_radius", None)
+    if r is None:
+        env = os.environ.get("NMS_SPATIAL_RADIUS")
+        if env is not None and env.strip() != "":
+            r = float(env)
+    if r is None:
+        return None
+    r = float(r)
+    if not math.isfinite(r):
+        return None
+    return r
 
 
 class CLIPVisionTower_PruneSID(nn.Module):
@@ -113,16 +187,23 @@ class CLIPVisionTower_PruneSID(nn.Module):
 
             need_token_num = self.need_token_num if self.need_token_num else 192
             group_method = getattr(self, "group_method", "dgsm")
+            final_refine = getattr(self, "final_refine", "lloyd")
+            merge_spatial_gamma = float(getattr(self, "merge_spatial_gamma", 0.0) or 0.0)
+            merge_cost_normalize = bool(getattr(self, "merge_cost_normalize", False))
             # Reuse CLS→patch attention already computed in this forward (no extra pass).
             cls_idx = 0
             cls_attention = attn_weights[:, :, cls_idx, cls_idx + 1 :]
             cls_attention_sum = cls_attention.sum(dim=1)  # [B, 576]
             # K aligned with PSCA: need_token_num / 4
+            k = int(need_token_num / 4)
             projector_lengths, belong_components = group_tokens(
                 hidden_states,
-                min_components=int(need_token_num / 4),
+                min_components=k,
                 group_method=group_method,
                 token_importance=cls_attention_sum,
+                final_refine=final_refine,
+                merge_spatial_gamma=merge_spatial_gamma,
+                merge_cost_normalize=merge_cost_normalize,
             )  # [B, 576, K], [B, 576]
             projector_scores = cls_attention_sum.unsqueeze(-1).repeat(
                 1, 1, projector_lengths.shape[-1]
@@ -145,9 +226,20 @@ class CLIPVisionTower_PruneSID(nn.Module):
             sim_mean = (similarity * (triu_mask)).sum(-1).sum(-1) / triu_mask.sum(-1).sum(-1)
             ratio = need_token_num / 32
 
-            
+            n_patches = similarity.shape[-1]
+            nms_r = _resolve_nms_spatial_radius(self)
+            token_xy = None
+            if nms_r is not None:
+                token_xy = _patch_xy_normalized(
+                    n_patches, similarity.device, similarity.dtype
+                )
+
             keep_nms_counts, projector_scores = batch_similarity_nms(
-                similarity, projector_scores, ratio * sim_mean
+                similarity,
+                projector_scores,
+                ratio * sim_mean,
+                spatial_radius=nms_r,
+                token_xy=token_xy,
             )
             group_counts = (projector_mask == index_map).sum(dim=1) # [batch_size, group]
             group_lower_bound = torch.ones_like(group_counts, device=group_counts.device)

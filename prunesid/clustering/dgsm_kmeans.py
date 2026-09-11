@@ -592,6 +592,22 @@ def _split_one_round(
 # ---------------------------------------------------------------------------
 
 
+def _pair_importance(
+    cluster_imp: torch.Tensor,
+    imp_pair: str,
+    merge_imp_alpha: float,
+) -> torch.Tensor:
+    ii = cluster_imp.unsqueeze(2)
+    jj = cluster_imp.unsqueeze(1)
+    if imp_pair == "max":
+        return torch.maximum(ii, jj)
+    if imp_pair == "soft":
+        a_max = torch.maximum(ii, jj)
+        a_mean = 0.5 * (ii + jj)
+        return merge_imp_alpha * a_max + (1.0 - merge_imp_alpha) * a_mean
+    return 0.5 * (ii + jj)
+
+
 def _merge_cost_from_gram(
     counts: torch.Tensor,
     gram: torch.Tensor,
@@ -601,45 +617,85 @@ def _merge_cost_from_gram(
     imp_pair: str = "mean",
     merge_imp_alpha: float = 0.7,
     merge_size_gamma: float = 0.0,
+    *,
+    xy_sum: Optional[torch.Tensor] = None,
+    merge_spatial_gamma: float = 0.0,
+    merge_cost_normalize: bool = False,
 ) -> torch.Tensor:
     """
     Pairwise merge score (higher = merge first).
 
-    Score = G_DGSM - λ A_ij + γ log(n_i + n_j)
+    Default (legacy):
+      Score = G_DGSM - λ A_ij + γ_size log(n_i + n_j)
 
-    A_ij from cluster importance I_c:
-      mean | max | soft (α·max + (1-α)·mean)
+    Optional scale-calibrated spatial merge (V3 ablation):
+      C_ij = -G_DGSM   (Ward SSE increase, smaller better)
+      J_ij = C/s_C + λ̃ A/s_A + γ D_spatial
+      Score = -J
+      D_spatial = ||μ^p_i - μ^p_j||_2^2 / 2,  μ^p in [0,1]^2
+      s_C / s_A are per-image finite-pair medians / nonempty means.
     """
     _B, K = counts.shape
     device = counts.device
+    dtype = counts.dtype
     ti = counts.unsqueeze(2)
     tj = counts.unsqueeze(1)
     numer = -(
         tj * tj * sn.unsqueeze(2) + ti * ti * sn.unsqueeze(1) - 2.0 * ti * tj * gram
     )
     denom = ti * tj * (ti + tj)
-    cost = numer / denom.clamp_min(torch.finfo(counts.dtype).tiny)
-
-    if merge_size_gamma > 0:
-        cost = cost + merge_size_gamma * torch.log((ti + tj).clamp_min(1.0))
-
-    if cluster_imp is not None and merge_imp_lambda > 0:
-        ii = cluster_imp.unsqueeze(2)
-        jj = cluster_imp.unsqueeze(1)
-        if imp_pair == "max":
-            a_ij = torch.maximum(ii, jj)
-        elif imp_pair == "soft":
-            a_max = torch.maximum(ii, jj)
-            a_mean = 0.5 * (ii + jj)
-            a_ij = merge_imp_alpha * a_max + (1.0 - merge_imp_alpha) * a_mean
-        else:
-            a_ij = 0.5 * (ii + jj)
-        cost = cost - merge_imp_lambda * a_ij
+    g_dgsm = numer / denom.clamp_min(torch.finfo(dtype).tiny)
 
     invalid = (counts.unsqueeze(2) <= 0) | (counts.unsqueeze(1) <= 0)
-    cost = cost.masked_fill(invalid, float("-inf"))
     eye = torch.eye(K, dtype=torch.bool, device=device).unsqueeze(0)
-    cost = cost.masked_fill(eye, float("-inf"))
+    valid_pair = (~invalid) & (~eye)
+
+    a_ij = None
+    if cluster_imp is not None and merge_imp_lambda > 0:
+        a_ij = _pair_importance(cluster_imp, imp_pair, merge_imp_alpha)
+
+    d_spatial = None
+    if (
+        merge_spatial_gamma > 0
+        and xy_sum is not None
+        and counts is not None
+    ):
+        mu = xy_sum / counts.clamp_min(1.0).unsqueeze(-1)
+        diff = mu.unsqueeze(2) - mu.unsqueeze(1)
+        d_spatial = (diff * diff).sum(dim=-1) * 0.5
+
+    if merge_cost_normalize:
+        # Lower-is-better J, then flip for argmax.
+        c_ward = (-g_dgsm).clamp_min(0.0)
+        # Per-image scale: median of valid pairwise C.
+        c_flat = c_ward.masked_fill(~valid_pair, float("nan"))
+        s_c = torch.nanmedian(c_flat.reshape(_B, -1), dim=-1).values
+        s_c = s_c.clamp_min(torch.finfo(dtype).tiny).view(_B, 1, 1)
+        j = c_ward / s_c
+        if a_ij is not None:
+            nonempty = counts > 0
+            a_mean = (cluster_imp * nonempty.to(dtype)).sum(dim=-1) / nonempty.to(
+                dtype
+            ).sum(dim=-1).clamp_min(1.0)
+            s_a = a_mean.clamp_min(torch.finfo(dtype).tiny).view(_B, 1, 1)
+            j = j + merge_imp_lambda * (a_ij / s_a)
+        if d_spatial is not None:
+            j = j + merge_spatial_gamma * d_spatial
+        if merge_size_gamma > 0:
+            # Prefer keeping large regions → slightly lower J when merging large pairs.
+            j = j - merge_size_gamma * torch.log((ti + tj).clamp_min(1.0))
+        cost = -j
+    else:
+        cost = g_dgsm
+        if merge_size_gamma > 0:
+            cost = cost + merge_size_gamma * torch.log((ti + tj).clamp_min(1.0))
+        if a_ij is not None:
+            cost = cost - merge_imp_lambda * a_ij
+        if d_spatial is not None:
+            # Unnormalized soft spatial penalty (prefer V3 normalize path).
+            cost = cost - merge_spatial_gamma * d_spatial
+
+    cost = cost.masked_fill(~valid_pair, float("-inf"))
     return cost
 
 
@@ -758,6 +814,9 @@ def _merge_back_gpu(
     merge_size_gamma: float = 0.0,
     xy: Optional[torch.Tensor] = None,
     merge_spatial_beta: float = 0.0,
+    merge_spatial_gamma: float = 0.0,
+    merge_cost_normalize: bool = False,
+    debug_merge_attn: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, N, _D = data.shape
     device, dtype = data.device, data.dtype
@@ -769,8 +828,11 @@ def _merge_back_gpu(
     att_sum = (
         _att_sum_from_labels(labels, token_imp, max_k) if token_imp is not None else None
     )
+    need_xy_stats = xy is not None and (
+        merge_spatial_beta > 0 or merge_spatial_gamma > 0
+    )
     xy_sum = xy_sumsq = None
-    if xy is not None and merge_spatial_beta > 0:
+    if need_xy_stats:
         xy_sum, xy_sumsq = _init_cluster_xy_stats(labels, xy, max_k, dtype)
 
     parent = (
@@ -778,6 +840,9 @@ def _merge_back_gpu(
     )
     triu = torch.triu(torch.ones(max_k, max_k, dtype=torch.bool, device=device), diagonal=1)
     eye = torch.eye(max_k, dtype=torch.bool, device=device)
+
+    dbg_changed = 0
+    dbg_total = 0
 
     for _ in range(max_k - k):
         cluster_imp = _cluster_merge_importance(
@@ -792,12 +857,35 @@ def _merge_back_gpu(
             imp_pair=imp_pair,
             merge_imp_alpha=merge_imp_alpha,
             merge_size_gamma=merge_size_gamma,
+            xy_sum=xy_sum,
+            merge_spatial_gamma=merge_spatial_gamma,
+            merge_cost_normalize=merge_cost_normalize,
         )
         cost = cost.masked_fill(eye.unsqueeze(0), float("-inf"))
         cost = cost.masked_fill(~triu.unsqueeze(0), float("-inf"))
         nonempty = (counts > 0).sum(dim=-1)
         need = nonempty > k
         cost = cost.masked_fill(~need.view(B, 1, 1), float("-inf"))
+
+        if debug_merge_attn and cluster_imp is not None and merge_imp_lambda > 0:
+            cost_sse = _merge_cost_from_gram(
+                counts,
+                gram,
+                sn,
+                cluster_imp=None,
+                merge_imp_lambda=0.0,
+                merge_size_gamma=merge_size_gamma,
+                xy_sum=xy_sum,
+                merge_spatial_gamma=merge_spatial_gamma,
+                merge_cost_normalize=merge_cost_normalize,
+            )
+            cost_sse = cost_sse.masked_fill(eye.unsqueeze(0), float("-inf"))
+            cost_sse = cost_sse.masked_fill(~triu.unsqueeze(0), float("-inf"))
+            cost_sse = cost_sse.masked_fill(~need.view(B, 1, 1), float("-inf"))
+            pure = cost_sse.reshape(B, -1).argmax(dim=-1)
+            with_att = cost.reshape(B, -1).argmax(dim=-1)
+            dbg_changed += int((pure != with_att).sum().item())
+            dbg_total += int(need.sum().item())
 
         flat = cost.reshape(B, -1)
         best = flat.argmax(dim=-1)
@@ -827,6 +915,14 @@ def _merge_back_gpu(
 
         match = (parent == bj.unsqueeze(1)) & valid_pair.unsqueeze(1)
         parent = torch.where(match, bi.unsqueeze(1).expand(B, max_k), parent)
+
+    if debug_merge_attn and dbg_total > 0:
+        print(
+            f"[dgsm_merge] attn changed pair {dbg_changed}/{dbg_total} "
+            f"({100.0 * dbg_changed / dbg_total:.1f}%) "
+            f"token_imp={'set' if token_imp is not None else 'None'} "
+            f"λ={merge_imp_lambda}"
+        )
 
     for _ in range(max_k):
         parent = torch.gather(parent, 1, parent)
@@ -866,6 +962,10 @@ def batch_dgsm_kmeans(
     merge_imp_alpha: float = 0.7,
     merge_size_gamma: float = 0.0,
     merge_spatial_beta: float = 0.0,
+    merge_spatial_gamma: float = 0.0,
+    merge_cost_normalize: bool = False,
+    final_refine: str = "lloyd",
+    debug_merge_attn: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     DGSM-KM+ clustering.
@@ -875,7 +975,15 @@ def batch_dgsm_kmeans(
     or aligned after drop). If None, importance terms are skipped.
 
     Merge score: G - λ A + γ log(n_i+n_j), with I_c = att/√n + β Var(x,y).
+
+    final_refine:
+      - "lloyd": final Euclidean Lloyd after merge (default baseline)
+      - "none": keep merge labels; still compute soft scores from merge centers
+                (ablation: does final Lloyd undo attention/spatial protection?)
     """
+    if final_refine not in ("lloyd", "none"):
+        raise ValueError(f"final_refine must be 'lloyd' or 'none', got {final_refine!r}")
+
     data = torch.sigmoid(features.to(torch.float32))
     if drop_cls:
         if data.shape[1] < 2:
@@ -903,7 +1011,11 @@ def batch_dgsm_kmeans(
         ti = ti / ti.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(ti.dtype).tiny)
         tok_imp = ti
 
-    need_xy = use_spatial_split or (merge_spatial_beta > 0)
+    need_xy = (
+        use_spatial_split
+        or (merge_spatial_beta > 0)
+        or (merge_spatial_gamma > 0)
+    )
     xy = _patch_xy(N, data.device, data.dtype) if need_xy else None
 
     centers = _kmeans_plusplus(data, k, seed, point_sq=point_sq)
@@ -957,6 +1069,9 @@ def batch_dgsm_kmeans(
             merge_size_gamma=merge_size_gamma,
             xy=xy,
             merge_spatial_beta=merge_spatial_beta,
+            merge_spatial_gamma=merge_spatial_gamma,
+            merge_cost_normalize=merge_cost_normalize,
+            debug_merge_attn=debug_merge_attn,
         )
         nonempty = counts > 0
         centers = sums / counts.clamp_min(1.0).unsqueeze(-1)
@@ -964,16 +1079,21 @@ def batch_dgsm_kmeans(
             fill = _kmeans_plusplus(data, k, seed + 1, point_sq=point_sq)
             centers = torch.where(nonempty.unsqueeze(-1), centers, fill)
 
-        labels, centers, dists = _lloyd(
-            data,
-            centers,
-            final_cap,
-            point_sq,
-            stop="sse_tol",
-            sse_rel_tol=sse_rel_tol,
-            return_full_dists=True,
-            seed=seed + 17,
-        )
+        if final_refine == "none":
+            # Ablation: keep merge labels. Soft scores still from merge centers.
+            # Do NOT reassign via argmin — that would undo merge protection.
+            dists = _squared_dists(data, centers, point_sq)
+        else:
+            labels, centers, dists = _lloyd(
+                data,
+                centers,
+                final_cap,
+                point_sq,
+                stop="sse_tol",
+                sse_rel_tol=sse_rel_tol,
+                return_full_dists=True,
+                seed=seed + 17,
+            )
     else:
         dists = _squared_dists(data, centers, point_sq)
         labels = dists.argmin(dim=-1)
@@ -982,4 +1102,4 @@ def batch_dgsm_kmeans(
     return soft, labels
 
 
-__all__ = ["batch_dgsm_kmeans", "_HAS_FLASH_KMEANS"]
+__all__ = ["batch_dgsm_kmeans", "_HAS_FLASH_KMEANS", "_patch_xy"]

@@ -296,6 +296,39 @@ def parse_eval_args() -> argparse.Namespace:
             "psca=original PCA grouping. K = need_token_num/4."
         ),
     )
+    parser.add_argument(
+        "--final_refine",
+        type=str,
+        default="lloyd",
+        choices=["lloyd", "none"],
+        help=(
+            "After split/merge: 'lloyd' runs final Euclidean Lloyd (baseline); "
+            "'none' keeps merge labels (V1 ablation)."
+        ),
+    )
+    parser.add_argument(
+        "--nms_spatial_radius",
+        type=float,
+        default=None,
+        help=(
+            "Chebyshev radius in normalized [0,1]^2 patch coords for spatial NMS. "
+            "Omit or +inf = feature-only NMS (baseline). Try 0.5 / 0.25 (V2)."
+        ),
+    )
+    parser.add_argument(
+        "--merge_spatial_gamma",
+        type=float,
+        default=0.0,
+        help=(
+            "V3 soft pairwise spatial merge penalty weight. "
+            "Use with --merge_cost_normalize for scale-calibrated J."
+        ),
+    )
+    parser.add_argument(
+        "--merge_cost_normalize",
+        action="store_true",
+        help="V3: per-image normalize SSE/attention before adding spatial merge term.",
+    )
     args = parser.parse_args()
     return args
 

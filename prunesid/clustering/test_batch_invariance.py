@@ -46,8 +46,70 @@ def test_dgsm_km_att_batch_invariant():
     )
 
 
+def test_final_refine_none_keeps_merge_labels():
+    """final_refine=none must not reassign via Euclidean argmin after merge."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(2)
+    x = torch.randn(2, 577, 32, device=device)
+    imp = torch.rand(2, 576, device=device)
+    soft_l, lab_l = batch_dgsm_km_att(
+        x, min_components=8, seed=11, token_importance=imp, final_refine="lloyd"
+    )
+    soft_n, lab_n = batch_dgsm_km_att(
+        x, min_components=8, seed=11, token_importance=imp, final_refine="none"
+    )
+    assert soft_l.shape == soft_n.shape == (2, 576, 8)
+    assert lab_l.shape == lab_n.shape == (2, 576)
+    # Soft still defined; labels may differ when Lloyd moves boundaries.
+    # At minimum, none path must be batch-invariant itself.
+    _, lab_n1 = batch_dgsm_km_att(
+        x[0:1], min_components=8, seed=11, token_importance=imp[0:1], final_refine="none"
+    )
+    assert torch.equal(lab_n1[0], lab_n[0])
+
+
+def test_spatial_nms_far_tokens_not_suppressed():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "prunesid_llava" / "clip_encoder.py"
+    spec = importlib.util.spec_from_file_location("clip_encoder_nms_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    N, K = 16, 2  # 4x4 grid
+    # Two identical features at opposite corners of the same group.
+    feats = torch.zeros(1, N, 4)
+    feats[0, 0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    feats[0, 15] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    feats[0, 1] = torch.tensor([0.0, 1.0, 0.0, 0.0])
+    sim = torch.bmm(
+        torch.nn.functional.normalize(feats, dim=-1),
+        torch.nn.functional.normalize(feats, dim=-1).transpose(1, 2),
+    )
+    scores = torch.zeros(1, N, K)
+    scores[0, 0, 0] = 10.0
+    scores[0, 15, 0] = 9.0
+    scores[0, 1, 1] = 8.0
+    thr = torch.tensor([0.5])
+    xy = mod._patch_xy_normalized(N, torch.device("cpu"), torch.float32)
+
+    # Feature-only: token 15 suppressed by token 0 (sim≈1).
+    keep0, _ = mod.batch_similarity_nms(sim, scores, thr, spatial_radius=None)
+    assert int(keep0[0, 0].item()) == 1
+
+    # Spatial r=0.25: corners are far (Chebyshev=1) → both kept in group 0.
+    keep1, _ = mod.batch_similarity_nms(
+        sim, scores, thr, spatial_radius=0.25, token_xy=xy
+    )
+    assert int(keep1[0, 0].item()) == 2
+
+
 if __name__ == "__main__":
     test_kpp_batch_invariant()
     test_dgsm_kmeans_batch_invariant()
     test_dgsm_km_att_batch_invariant()
+    test_final_refine_none_keeps_merge_labels()
+    test_spatial_nms_far_tokens_not_suppressed()
     print("ok")

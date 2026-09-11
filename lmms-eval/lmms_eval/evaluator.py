@@ -187,7 +187,15 @@ def simple_evaluate(
     if cli_args.plug_in_model == "prunesid_llava":
         from prunesid.prunesid_llava import prunesid_llava
         group_method = getattr(cli_args, "group_method", "dgsm")
-        lm._model = prunesid_llava(lm._model, cli_args.need_token_num, group_method=group_method)
+        lm._model = prunesid_llava(
+            lm._model,
+            cli_args.need_token_num,
+            group_method=group_method,
+            final_refine=getattr(cli_args, "final_refine", "lloyd"),
+            nms_spatial_radius=getattr(cli_args, "nms_spatial_radius", None),
+            merge_spatial_gamma=float(getattr(cli_args, "merge_spatial_gamma", 0.0) or 0.0),
+            merge_cost_normalize=bool(getattr(cli_args, "merge_cost_normalize", False)),
+        )
     elif cli_args.plug_in_model == "prunesid_qwen2":
         from prunesid.prunesid_qwen import prunesid_qwen2
         group_method = getattr(cli_args, "group_method", "dgsm")
