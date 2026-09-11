@@ -1,10 +1,7 @@
-"""Numba backend for DGSM-CDKM.
+"""Numba hot kernels for DGSM-CDKM (CD + hierarchical merge + merge-back).
 
-Kept in a separate top-level module so Numba's on-disk cache can be reused
-across lmms-eval processes. No fastmath. Decision statistics stay FP64.
-
-Token-order coordinate descent is sequential within each sample; only the
-batch axis may use prange.
+BLAS-heavy steps stay in NumPy. No fastmath; FP64 decision path; strict '>' ties.
+Token axis is sequential; do not prange over tokens.
 """
 
 from __future__ import annotations
@@ -12,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 try:
-    from numba import njit, prange
+    from numba import njit
 
     _HAS_NUMBA = True
 except ImportError:  # pragma: no cover
@@ -22,7 +19,7 @@ except ImportError:  # pragma: no cover
 if _HAS_NUMBA:
 
     @njit(cache=True)
-    def _merge_tar_diff(temp0, temp1, i, j):
+    def merge_tar_diff(temp0, temp1, i, j):
         ti = temp1[i]
         tj = temp1[j]
         if ti <= 0.0 or tj <= 0.0:
@@ -32,27 +29,10 @@ if _HAS_NUMBA:
         for d in range(m):
             v = temp0[d, i] * tj - temp0[d, j] * ti
             numerator -= v * v
-        denom = ti * tj * (ti + tj)
-        return numerator / denom
+        return numerator / (ti * tj * (ti + tj))
 
     @njit(cache=True)
-    def _cluster_ave_var(F, temp0, temp1, point_sq, c):
-        np_c = temp1[c]
-        if np_c <= 1.0:
-            return 0.0
-        n = F.shape[0]
-        sum_x2 = 0.0
-        for i in range(n):
-            if F[i, c] != 0.0:
-                sum_x2 += point_sq[i]
-        sumX_dot = 0.0
-        m = temp0.shape[0]
-        for d in range(m):
-            sumX_dot += temp0[d, c] * temp0[d, c]
-        return sum_x2 - sumX_dot / np_c
-
-    @njit(cache=True)
-    def _one_cd(data, F, temp0, temp1, temp2, point_sq, active_k):
+    def one_cd(data, F, temp0, temp1, temp2, point_sq, active_k):
         n, m = data.shape
         moved = 0
         labels = np.empty(n, dtype=np.int64)
@@ -93,7 +73,6 @@ if _HAS_NUMBA:
                     dot_j += data[i, d] * temp0[d, j]
                 m4 = temp2[j] + 2.0 * dot_j + xi_sq
                 Mj = m4 / (nj + 1.0) - temp2[j] / nj
-                # Strict > preserves first-best on ties (same as prior port).
                 if Mj > best_M:
                     best_M = Mj
                     best_q = j
@@ -119,7 +98,7 @@ if _HAS_NUMBA:
         return moved
 
     @njit(cache=True)
-    def _hierarchical_merge_to_two(
+    def hierarchical_merge_to_two(
         X,
         F,
         temp0,
@@ -168,7 +147,7 @@ if _HAS_NUMBA:
                 for b in range(a + 1, true_split_clu_num):
                     if active[b] == 0 or initial_temp1[b] == 0.0:
                         continue
-                    val = _merge_tar_diff(initial_temp0, initial_temp1, a, b)
+                    val = merge_tar_diff(initial_temp0, initial_temp1, a, b)
                     if val > best_val:
                         best_val = val
                         best_a = a
@@ -230,58 +209,7 @@ if _HAS_NUMBA:
             temp2[new_clu] = ss1
 
     @njit(cache=True)
-    def _select_top_dims(dim_scores, true_split_num):
-        """Deterministic top-k: sort by (-score, +index), take first k."""
-        m = dim_scores.shape[0]
-        ksel = true_split_num
-        if ksel > m:
-            ksel = m
-        order = np.empty(m, dtype=np.int64)
-        for i in range(m):
-            order[i] = i
-        # Insertion sort: higher score first; on tie, smaller index first.
-        for i in range(1, m):
-            key = order[i]
-            key_score = dim_scores[key]
-            j = i - 1
-            while j >= 0:
-                cur = order[j]
-                cur_score = dim_scores[cur]
-                # cur should stay before key?
-                if cur_score > key_score or (cur_score == key_score and cur < key):
-                    break
-                order[j + 1] = cur
-                j -= 1
-            order[j + 1] = key
-        out = np.empty(ksel, dtype=np.int64)
-        for i in range(ksel):
-            out[i] = order[i]
-        return out
-
-    @njit(cache=True)
-    def _sync_stats_from_F(data, F, temp0, temp1, temp2, k):
-        n, m = data.shape
-        for c in range(k):
-            cnt = 0.0
-            for d in range(m):
-                temp0[d, c] = 0.0
-            for i in range(n):
-                if F[i, c] != 0.0:
-                    cnt += 1.0
-                    for d in range(m):
-                        temp0[d, c] += data[i, d]
-            temp1[c] = cnt
-            if cnt > 0.0:
-                ss = 0.0
-                for d in range(m):
-                    ss += temp0[d, c] * temp0[d, c]
-                temp2[c] = ss
-            else:
-                temp2[c] = 0.0
-
-    @njit(cache=True)
-    def _merge_back_to_k(F, temp0, temp1, temp2, clu_num, k, max_k):
-        """Rescan best-pair merge (strict >). Equivalent to lazy heap with same keys."""
+    def merge_back_to_k(F, temp0, temp1, temp2, clu_num, k, max_k):
         while clu_num > k:
             best_diff = -np.inf
             best_i = -1
@@ -292,7 +220,7 @@ if _HAS_NUMBA:
                 for j in range(i + 1, max_k):
                     if temp1[j] <= 0.0:
                         continue
-                    diff = _merge_tar_diff(temp0, temp1, i, j)
+                    diff = merge_tar_diff(temp0, temp1, i, j)
                     if diff > best_diff:
                         best_diff = diff
                         best_i = i
@@ -317,7 +245,6 @@ if _HAS_NUMBA:
             temp2[best_j] = 0.0
             clu_num -= 1
 
-        # Compact non-empty clusters into first k columns.
         write = 0
         n = F.shape[0]
         m = temp0.shape[0]
@@ -343,300 +270,51 @@ if _HAS_NUMBA:
             temp1[c] = 0.0
             temp2[c] = 0.0
 
-    @njit(cache=True)
-    def run_single(
-        data,
-        k,
-        init_indices,
-        max_cd_iters,
-        do_split_merge,
-        empty_center_idx,
-    ):
-        """
-        Faithful DGSM-CDKM on one sample.
-
-        data: float64 [n, m], contiguous
-        init_indices: int64 [k]
-        Returns labels int64 [n], centers float32 [k, m], soft float32 [n, k]
-        """
-        n, m = data.shape
-        if do_split_merge:
-            max_k = k
-            grown = int(1.5 * k)
-            if grown > max_k:
-                max_k = grown
-        else:
-            max_k = k
-        if max_k > n:
-            max_k = n
-        split_num = 3
-        if m < split_num:
-            split_num = m
-
-        point_sq = np.empty(n, dtype=np.float64)
-        for i in range(n):
-            s = 0.0
-            for d in range(m):
-                s += data[i, d] * data[i, d]
-            point_sq[i] = s
-
-        # Initial assignment to k-means++ centers (force init points onto themselves).
-        labels0 = np.empty(n, dtype=np.int64)
-        for i in range(n):
-            forced = -1
-            for c in range(k):
-                if init_indices[c] == i:
-                    forced = c
-                    break
-            if forced >= 0:
-                labels0[i] = forced
-                continue
-            best_c = 0
-            best_d = np.inf
-            for c in range(k):
-                idx = init_indices[c]
-                d2 = 0.0
-                for d in range(m):
-                    z = data[i, d] - data[idx, d]
-                    d2 += z * z
-                if d2 < best_d:
-                    best_d = d2
-                    best_c = c
-            labels0[i] = best_c
-
-        F = np.zeros((n, max_k), dtype=np.float64)
-        for i in range(n):
-            F[i, labels0[i]] = 1.0
-
-        temp0 = np.zeros((m, max_k), dtype=np.float64)
-        temp1 = np.zeros(max_k, dtype=np.float64)
-        temp2 = np.zeros(max_k, dtype=np.float64)
-        _sync_stats_from_F(data, F, temp0, temp1, temp2, k)
-
-        _one_cd(data, F, temp0, temp1, temp2, point_sq, k)
-        _one_cd(data, F, temp0, temp1, temp2, point_sq, k)
-
-        clu_num = k
-        if do_split_merge and max_k > k:
-            clu_ave_var = np.zeros(max_k, dtype=np.float64)
-            for c in range(k):
-                clu_ave_var[c] = _cluster_ave_var(F, temp0, temp1, point_sq, c)
-
-            while clu_num < max_k:
-                split_clu_no = 0
-                best_var = clu_ave_var[0]
-                for c in range(1, clu_num):
-                    if clu_ave_var[c] > best_var:
-                        best_var = clu_ave_var[c]
-                        split_clu_no = c
-                if clu_ave_var[split_clu_no] == 0.0 or temp1[split_clu_no] <= 1.0:
-                    break
-
-                # Collect members (stable ascending index order, same as np.where).
-                clu_split_dot_num = 0
-                for i in range(n):
-                    if F[i, split_clu_no] != 0.0:
-                        clu_split_dot_num += 1
-                if clu_split_dot_num < 2:
-                    break
-                split_locs = np.empty(clu_split_dot_num, dtype=np.int64)
-                p = 0
-                for i in range(n):
-                    if F[i, split_clu_no] != 0.0:
-                        split_locs[p] = i
-                        p += 1
-
-                true_split_clu_num = 1
-                for _ in range(split_num):
-                    true_split_clu_num *= 2
-                true_split_num = split_num
-                while clu_split_dot_num < true_split_clu_num:
-                    true_split_clu_num //= 2
-                    true_split_num -= 1
-                if true_split_num <= 0:
-                    true_split_num = 1
-                    true_split_clu_num = 2
-
-                mean = np.empty(m, dtype=np.float64)
-                for d in range(m):
-                    mean[d] = temp0[d, split_clu_no] / clu_split_dot_num
-
-                dim_scores = np.zeros(m, dtype=np.float64)
-                for j in range(clu_split_dot_num):
-                    idx = split_locs[j]
-                    for d in range(m):
-                        v = data[idx, d] - mean[d]
-                        if v < 0.0:
-                            v = -v
-                        dim_scores[d] += v
-
-                chosen_dims = _select_top_dims(dim_scores, true_split_num)
-                split_signs = np.zeros(clu_split_dot_num, dtype=np.int64)
-                for t in range(true_split_num):
-                    dim = chosen_dims[t]
-                    center = mean[dim]
-                    for j in range(clu_split_dot_num):
-                        ge = 1 if data[split_locs[j], dim] >= center else 0
-                        split_signs[j] = (split_signs[j] << 1) | ge
-
-                _hierarchical_merge_to_two(
-                    data,
-                    F,
-                    temp0,
-                    temp1,
-                    temp2,
-                    split_clu_no,
-                    clu_num,
-                    split_locs,
-                    split_signs,
-                    true_split_clu_num,
-                )
-                clu_ave_var[split_clu_no] = _cluster_ave_var(
-                    F, temp0, temp1, point_sq, split_clu_no
-                )
-                clu_ave_var[clu_num] = _cluster_ave_var(
-                    F, temp0, temp1, point_sq, clu_num
-                )
-                clu_num += 1
-
-            _one_cd(data, F, temp0, temp1, temp2, point_sq, clu_num)
-            _one_cd(data, F, temp0, temp1, temp2, point_sq, clu_num)
-            _merge_back_to_k(F, temp0, temp1, temp2, clu_num, k, max_k)
-
-        _sync_stats_from_F(data, F, temp0, temp1, temp2, k)
-
-        for _ in range(max_cd_iters):
-            moved = _one_cd(data, F, temp0, temp1, temp2, point_sq, k)
-            if moved == 0:
-                break
-
-        labels = np.empty(n, dtype=np.int64)
-        for i in range(n):
-            p = 0
-            for j in range(k):
-                if F[i, j] != 0.0:
-                    p = j
-                    break
-            labels[i] = p
-
-        centers_out = np.zeros((k, m), dtype=np.float64)
-        counts = np.zeros(k, dtype=np.int64)
-        for i in range(n):
-            c = labels[i]
-            counts[c] += 1
-            for d in range(m):
-                centers_out[c, d] += data[i, d]
-        for c in range(k):
-            if counts[c] > 0:
-                inv = 1.0 / counts[c]
-                for d in range(m):
-                    centers_out[c, d] *= inv
-            else:
-                idx = empty_center_idx
-                if idx < 0 or idx >= n:
-                    idx = 0
-                for d in range(m):
-                    centers_out[c, d] = data[idx, d]
-
-        # Soft scores from dists to these centers; then reassign; then refresh means.
-        # (Matches prior Python quirk: soft uses pre-refresh distances.)
-        soft = np.empty((n, k), dtype=np.float32)
-        dists = np.empty((n, k), dtype=np.float64)
-        cen_sq = np.empty(k, dtype=np.float64)
-        for c in range(k):
-            s = 0.0
-            for d in range(m):
-                s += centers_out[c, d] * centers_out[c, d]
-            cen_sq[c] = s
-        for i in range(n):
-            best_c = 0
-            best_d = np.inf
-            for c in range(k):
-                cross = 0.0
-                for d in range(m):
-                    cross += data[i, d] * centers_out[c, d]
-                d2 = point_sq[i] + cen_sq[c] - 2.0 * cross
-                dists[i, c] = d2
-                soft[i, c] = np.float32(-d2)
-                if d2 < best_d:
-                    best_d = d2
-                    best_c = c
-            labels[i] = best_c
-
-        for c in range(k):
-            for d in range(m):
-                centers_out[c, d] = 0.0
-            counts[c] = 0
-        for i in range(n):
-            c = labels[i]
-            counts[c] += 1
-            for d in range(m):
-                centers_out[c, d] += data[i, d]
-        centers_f32 = np.empty((k, m), dtype=np.float32)
-        for c in range(k):
-            if counts[c] > 0:
-                inv = 1.0 / counts[c]
-                for d in range(m):
-                    centers_f32[c, d] = np.float32(centers_out[c, d] * inv)
-            else:
-                idx = empty_center_idx
-                if idx < 0 or idx >= n:
-                    idx = 0
-                for d in range(m):
-                    centers_f32[c, d] = np.float32(data[idx, d])
-
-        return labels, centers_f32, soft
-
-    @njit(cache=True, parallel=True)
-    def run_batch(data_b, k, init_indices_b, max_cd_iters, do_split_merge, empty_center_idx_b):
-        """
-        Independent samples on batch axis only.
-
-        data_b: [B, n, m] float64
-        init_indices_b: [B, k] int64
-        empty_center_idx_b: [B] int64
-        """
-        B = data_b.shape[0]
-        n = data_b.shape[1]
-        m = data_b.shape[2]
-        labels_b = np.empty((B, n), dtype=np.int64)
-        centers_b = np.empty((B, k, m), dtype=np.float32)
-        soft_b = np.empty((B, n, k), dtype=np.float32)
-        for b in prange(B):
-            labels, centers, soft = run_single(
-                data_b[b],
-                k,
-                init_indices_b[b],
-                max_cd_iters,
-                do_split_merge,
-                empty_center_idx_b[b],
-            )
-            labels_b[b] = labels
-            centers_b[b] = centers
-            soft_b[b] = soft
-        return labels_b, centers_b, soft_b
-
 else:  # pragma: no cover
 
-    def run_single(*args, **kwargs):
-        raise RuntimeError("numba is required for dgsm_cdkm_numba")
+    def one_cd(*args, **kwargs):
+        raise RuntimeError("numba is required")
 
-    def run_batch(*args, **kwargs):
-        raise RuntimeError("numba is required for dgsm_cdkm_numba")
+    def hierarchical_merge_to_two(*args, **kwargs):
+        raise RuntimeError("numba is required")
+
+    def merge_back_to_k(*args, **kwargs):
+        raise RuntimeError("numba is required")
+
+    def merge_tar_diff(*args, **kwargs):
+        raise RuntimeError("numba is required")
 
 
 def warmup(n: int = 64, m: int = 64, k: int = 8) -> None:
-    """Compile and cache kernels once before evaluation."""
     if not _HAS_NUMBA:
         return
     rng = np.random.default_rng(0)
     data = np.ascontiguousarray(rng.normal(size=(n, m)), dtype=np.float64)
-    init = np.ascontiguousarray(rng.choice(n, size=k, replace=False), dtype=np.int64)
-    run_single(data, k, init, 10, True, 0)
-    data_b = np.ascontiguousarray(rng.normal(size=(2, n, m)), dtype=np.float64)
-    init_b = np.stack([init, init], axis=0)
-    empty_b = np.zeros(2, dtype=np.int64)
-    run_batch(data_b, k, init_b, 10, True, empty_b)
+    F = np.zeros((n, k), dtype=np.float64)
+    labels = rng.integers(0, k, size=n)
+    F[np.arange(n), labels] = 1.0
+    temp0 = np.zeros((m, k), dtype=np.float64)
+    temp1 = np.zeros(k, dtype=np.float64)
+    temp2 = np.zeros(k, dtype=np.float64)
+    point_sq = np.sum(data * data, axis=1)
+    for c in range(k):
+        members = F[:, c] > 0
+        temp1[c] = float(members.sum())
+        if temp1[c] > 0:
+            temp0[:, c] = data[members].sum(axis=0)
+            temp2[c] = float(np.dot(temp0[:, c], temp0[:, c]))
+    one_cd(data, F, temp0, temp1, temp2, point_sq, k)
+    locs = np.arange(min(8, n), dtype=np.int64)
+    signs = np.zeros(locs.shape[0], dtype=np.int64)
+    hierarchical_merge_to_two(data, F, temp0, temp1, temp2, 0, min(1, k - 1), locs, signs, 2)
+    merge_back_to_k(F, temp0, temp1, temp2, k, max(1, k // 2), k)
 
 
-__all__ = ["run_single", "run_batch", "warmup", "_HAS_NUMBA"]
+__all__ = [
+    "one_cd",
+    "hierarchical_merge_to_two",
+    "merge_back_to_k",
+    "merge_tar_diff",
+    "warmup",
+    "_HAS_NUMBA",
+]

@@ -1,4 +1,4 @@
-"""Regression checks for faithful DGSM-CDKM Numba acceleration."""
+"""Regression checks for hybrid DGSM-CDKM acceleration."""
 
 from __future__ import annotations
 

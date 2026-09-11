@@ -1,15 +1,17 @@
 """
 DGSM-CDKM clustering used as a drop-in replacement for PruneSID's PSCA grouping.
 
-Accuracy-preserving acceleration:
-  - Python/Torch wrapper for device I/O and k-means++ seeding
-  - Numba FP64 core for CD / split / merge (see dgsm_cdkm_numba.py)
-  - One host transfer per batch; batch axis may use prange
-  - Decision path keeps strict '>' tie-breaks (no parallel reduce on tokens)
+Hybrid accuracy-preserving acceleration:
+  - NumPy/BLAS for distance matrices, reductions, final soft scores
+  - Numba only for sequential CD / hierarchical merge / merge-back
+  - One host transfer per batch; optional thread pool over images
+  - Strict '>' tie-breaks; deterministic top-k dim selection
 """
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
 
 import numpy as np
@@ -23,7 +25,8 @@ _WARM = False
 def _ensure_warm() -> None:
     global _WARM
     if not _WARM and _nb._HAS_NUMBA:
-        _nb.warmup(n=32, m=64, k=8)
+        # Compile kernels at realistic vision sizes once.
+        _nb.warmup(n=64, m=128, k=8)
         _WARM = True
 
 
@@ -49,6 +52,36 @@ def kmeans_plusplus_init(data: np.ndarray, k: int, rng: np.random.Generator) -> 
     return centers_idx
 
 
+def _cluster_ave_var_from_F(F, temp0, temp1, point_sq, c) -> float:
+    np_c = temp1[c]
+    if np_c <= 1:
+        return 0.0
+    sum_x2 = float(point_sq @ F[:, c])
+    sumX_dot = float(np.dot(temp0[:, c], temp0[:, c]))
+    return sum_x2 - sumX_dot / np_c
+
+
+def _select_top_dims(dim_scores: np.ndarray, true_split_num: int) -> np.ndarray:
+    """Deterministic top-k by (-score, +index)."""
+    m = dim_scores.shape[0]
+    ksel = min(int(true_split_num), m)
+    # lexsort: last key is primary. Want higher score first, then smaller index.
+    order = np.lexsort((np.arange(m), -dim_scores))
+    return order[:ksel].astype(np.int64, copy=False)
+
+
+def _sync_stats_from_F(data64, F, temp0, temp1, temp2, k) -> None:
+    for c in range(k):
+        members = F[:, c] > 0
+        temp1[c] = float(members.sum())
+        if temp1[c] > 0:
+            temp0[:, c] = data64[members].sum(axis=0)
+            temp2[c] = float(np.dot(temp0[:, c], temp0[:, c]))
+        else:
+            temp0[:, c] = 0.0
+            temp2[c] = 0.0
+
+
 def dgsm_cdkm(
     data: np.ndarray,
     k: int,
@@ -58,13 +91,7 @@ def dgsm_cdkm(
     do_split_merge: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Run DGSM-CDKM on one sample.
-
-    Args:
-        data: [n, m] points
-        k: number of clusters (aligned with PSCA's K)
-        max_cd_iters: cap on final CD; stops early when a pass moves 0 points
-        do_split_merge: if False, skip oversplit/merge
+    Run DGSM-CDKM on one sample (NumPy/BLAS + Numba CD/merge).
     """
     if not _nb._HAS_NUMBA:
         raise RuntimeError(
@@ -76,7 +103,7 @@ def dgsm_cdkm(
 
     data_f32 = np.ascontiguousarray(data, dtype=np.float32)
     data64 = np.ascontiguousarray(data_f32, dtype=np.float64)
-    n, _m = data64.shape
+    n, m = data64.shape
     if n == 0:
         raise ValueError("empty data")
     k = int(max(1, min(k, n)))
@@ -85,18 +112,136 @@ def dgsm_cdkm(
         init_indices = kmeans_plusplus_init(data_f32, k, rng)
     else:
         init_indices = np.asarray(init_indices, dtype=np.int64)[:k]
-    init_indices = np.ascontiguousarray(init_indices, dtype=np.int64)
 
-    empty_center_idx = int(rng.integers(0, n))
-    labels, centers, soft = _nb.run_single(
-        data64,
-        k,
-        init_indices,
-        int(max_cd_iters),
-        bool(do_split_merge),
-        empty_center_idx,
+    max_k = max(k, int(1.5 * k)) if do_split_merge else k
+    max_k = min(max_k, n)
+    split_num = min(3, m)
+
+    centers = data64[init_indices]
+    point_sq = np.sum(data64 * data64, axis=1)
+    cen_sq = np.sum(centers * centers, axis=1)
+    # BLAS GEMM for initial assignment
+    dists = point_sq[:, None] + cen_sq[None, :] - 2.0 * (data64 @ centers.T)
+    for j, idx in enumerate(init_indices):
+        dists[idx, :] = np.inf
+        dists[idx, j] = 0.0
+    labels0 = np.argmin(dists, axis=1)
+
+    F = np.zeros((n, max_k), dtype=np.float64)
+    F[np.arange(n), labels0] = 1.0
+
+    temp0 = np.zeros((m, max_k), dtype=np.float64)
+    temp1 = np.zeros(max_k, dtype=np.float64)
+    temp2 = np.zeros(max_k, dtype=np.float64)
+    _sync_stats_from_F(data64, F, temp0, temp1, temp2, k)
+
+    _nb.one_cd(data64, F, temp0, temp1, temp2, point_sq, k)
+    _nb.one_cd(data64, F, temp0, temp1, temp2, point_sq, k)
+
+    clu_num = k
+    if do_split_merge and max_k > k:
+        clu_ave_var = np.zeros(max_k, dtype=np.float64)
+        for c in range(k):
+            clu_ave_var[c] = _cluster_ave_var_from_F(F, temp0, temp1, point_sq, c)
+
+        while clu_num < max_k:
+            split_clu_no = int(np.argmax(clu_ave_var[:clu_num]))
+            if clu_ave_var[split_clu_no] == 0.0 or temp1[split_clu_no] <= 1.0:
+                break
+
+            split_locs = np.flatnonzero(F[:, split_clu_no] > 0).astype(np.int64, copy=False)
+            clu_split_dot_num = int(split_locs.shape[0])
+            if clu_split_dot_num < 2:
+                break
+
+            true_split_clu_num = 1 << split_num
+            true_split_num = split_num
+            while clu_split_dot_num < true_split_clu_num:
+                true_split_clu_num >>= 1
+                true_split_num -= 1
+            if true_split_num <= 0:
+                true_split_num = 1
+                true_split_clu_num = 2
+
+            mean = temp0[:, split_clu_no] / clu_split_dot_num
+            vals = data64[split_locs]
+            dim_scores = np.abs(vals - mean[None, :]).sum(axis=0)
+            chosen_dims = _select_top_dims(dim_scores, true_split_num)
+
+            split_signs = np.zeros(clu_split_dot_num, dtype=np.int64)
+            for dim in chosen_dims:
+                center = mean[dim]
+                ge = (data64[split_locs, dim] >= center).astype(np.int64)
+                split_signs = (split_signs << 1) | ge
+
+            _nb.hierarchical_merge_to_two(
+                data64,
+                F,
+                temp0,
+                temp1,
+                temp2,
+                split_clu_no,
+                clu_num,
+                split_locs,
+                split_signs,
+                true_split_clu_num,
+            )
+            clu_ave_var[split_clu_no] = _cluster_ave_var_from_F(
+                F, temp0, temp1, point_sq, split_clu_no
+            )
+            clu_ave_var[clu_num] = _cluster_ave_var_from_F(
+                F, temp0, temp1, point_sq, clu_num
+            )
+            clu_num += 1
+
+        _nb.one_cd(data64, F, temp0, temp1, temp2, point_sq, clu_num)
+        _nb.one_cd(data64, F, temp0, temp1, temp2, point_sq, clu_num)
+        _nb.merge_back_to_k(F, temp0, temp1, temp2, clu_num, k, max_k)
+
+    _sync_stats_from_F(data64, F, temp0, temp1, temp2, k)
+
+    for _ in range(max_cd_iters):
+        moved = int(_nb.one_cd(data64, F, temp0, temp1, temp2, point_sq, k))
+        if moved == 0:
+            break
+
+    labels = np.argmax(F[:, :k], axis=1).astype(np.int64)
+    centers_out = np.zeros((k, m), dtype=np.float64)
+    for c in range(k):
+        members = labels == c
+        if members.any():
+            centers_out[c] = data64[members].mean(axis=0)
+        else:
+            centers_out[c] = data64[int(rng.integers(0, n))]
+
+    cen_sq = np.sum(centers_out * centers_out, axis=1)
+    dists = point_sq[:, None] + cen_sq[None, :] - 2.0 * (data64 @ centers_out.T)
+    labels = np.argmin(dists, axis=1).astype(np.int64)
+    for c in range(k):
+        members = labels == c
+        if members.any():
+            centers_out[c] = data64[members].mean(axis=0)
+
+    soft_scores = (-dists).astype(np.float32)
+    return labels, centers_out.astype(np.float32), soft_scores
+
+
+def _cluster_one_sample(
+    data_f32: np.ndarray,
+    k: int,
+    seed: int,
+    max_cd_iters: int,
+    do_split_merge: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    labels, _, soft = dgsm_cdkm(
+        data_f32,
+        k=k,
+        rng=rng,
+        max_cd_iters=max_cd_iters,
+        do_split_merge=do_split_merge,
     )
-    return labels, centers, soft
+    return labels, soft
 
 
 def batch_dgsm_cdkm(
@@ -108,7 +253,7 @@ def batch_dgsm_cdkm(
     do_split_merge: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    PSCA-compatible batch wrapper — real DGSM-CDKM per sample (Numba core).
+    PSCA-compatible batch wrapper.
 
     Returns:
         soft_scores: [B, T_patch, K]
@@ -122,6 +267,7 @@ def batch_dgsm_cdkm(
 
     device = features.device
     dtype = torch.float32
+    # Keep sigmoid on-device; one contiguous host copy afterwards.
     x = torch.sigmoid(features.to(dtype))
 
     if drop_cls:
@@ -131,49 +277,64 @@ def batch_dgsm_cdkm(
     else:
         tokens = x
 
-    B, T, D = tokens.shape
+    B, T, _D = tokens.shape
     k = max(1, min(int(min_components), T))
 
-    # One host transfer for the whole batch.
-    tokens_np = (
-        tokens.detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
+    tokens_np = np.ascontiguousarray(
+        tokens.detach().to(dtype=torch.float32).cpu().numpy(), dtype=np.float32
     )
-    data_b = np.ascontiguousarray(tokens_np.astype(np.float64, copy=False))
 
-    init_indices_b = np.empty((B, k), dtype=np.int64)
-    empty_center_idx_b = np.empty(B, dtype=np.int64)
-    for b in range(B):
-        rng = np.random.default_rng(seed + b)
-        init_indices_b[b] = kmeans_plusplus_init(tokens_np[b], k, rng)
-        empty_center_idx_b[b] = int(rng.integers(0, T))
+    # Avoid OpenMP oversubscription: clustering threads x Numba threads.
+    # Default: 1 Numba thread per worker; workers = min(B, cpu, 4).
+    prev_numba_threads = None
+    try:
+        from numba import get_num_threads, set_num_threads
 
-    if B == 1:
-        labels, _centers, soft = _nb.run_single(
-            data_b[0],
-            k,
-            init_indices_b[0],
-            int(max_cd_iters),
-            bool(do_split_merge),
-            int(empty_center_idx_b[0]),
-        )
-        soft_scores = torch.from_numpy(np.ascontiguousarray(soft[:, :k]))
-        belong = torch.from_numpy(np.ascontiguousarray(labels))
-        soft_scores = soft_scores.unsqueeze(0).to(device=device, dtype=dtype, non_blocking=True)
-        belong = belong.unsqueeze(0).to(device=device, dtype=torch.long, non_blocking=True)
-        return soft_scores, belong
+        prev_numba_threads = get_num_threads()
+        set_num_threads(1)
+    except Exception:
+        set_num_threads = None  # type: ignore
 
-    labels_b, _centers_b, soft_b = _nb.run_batch(
-        data_b,
-        k,
-        init_indices_b,
-        int(max_cd_iters),
-        bool(do_split_merge),
-        empty_center_idx_b,
-    )
-    soft_scores = torch.from_numpy(np.ascontiguousarray(soft_b[:, :, :k])).to(
+    max_workers = int(os.environ.get("DGSM_BATCH_WORKERS", "0"))
+    if max_workers <= 0:
+        max_workers = min(B, max(1, min(4, (os.cpu_count() or 4) // 2)))
+
+    soft_list = [None] * B
+    belong_list = [None] * B
+
+    try:
+        if B == 1 or max_workers == 1:
+            for b in range(B):
+                labels, soft = _cluster_one_sample(
+                    tokens_np[b], k, seed + b, max_cd_iters, do_split_merge
+                )
+                soft_list[b] = soft[:, :k]
+                belong_list[b] = labels
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = {
+                    ex.submit(
+                        _cluster_one_sample,
+                        tokens_np[b],
+                        k,
+                        seed + b,
+                        max_cd_iters,
+                        do_split_merge,
+                    ): b
+                    for b in range(B)
+                }
+                for fut, b in futs.items():
+                    labels, soft = fut.result()
+                    soft_list[b] = soft[:, :k]
+                    belong_list[b] = labels
+    finally:
+        if set_num_threads is not None and prev_numba_threads is not None:
+            set_num_threads(prev_numba_threads)
+
+    soft_scores = torch.from_numpy(np.stack(soft_list, axis=0)).to(
         device=device, dtype=dtype, non_blocking=True
     )
-    belong = torch.from_numpy(np.ascontiguousarray(labels_b)).to(
+    belong = torch.from_numpy(np.stack(belong_list, axis=0)).to(
         device=device, dtype=torch.long, non_blocking=True
     )
     return soft_scores, belong
@@ -186,7 +347,6 @@ def warmup_dgsm_cdkm(n: int = 64, m: int = 64, k: int = 8) -> None:
     _WARM = True
 
 
-# Back-compat alias expected by cdkm_aism dgsm-init path.
 def _batch_dgsm_torch(
     data: torch.Tensor,
     k: int,
@@ -194,13 +354,8 @@ def _batch_dgsm_torch(
     max_iters: int = 100,
     do_split_merge: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Device-resident entry used by CDKM-AISM init_mode='dgsm'.
-
-    data: [B, T, D] already without CLS (caller responsibility).
-    Returns soft_scores [B,T,K], labels [B,T].
-    """
-    soft, belong = batch_dgsm_cdkm(
+    """Entry used by CDKM-AISM init_mode='dgsm'. data: [B,T,D] without CLS."""
+    return batch_dgsm_cdkm(
         data,
         min_components=k,
         seed=seed,
@@ -208,7 +363,6 @@ def _batch_dgsm_torch(
         max_cd_iters=max_iters,
         do_split_merge=do_split_merge,
     )
-    return soft, belong
 
 
 __all__ = [

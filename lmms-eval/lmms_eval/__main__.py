@@ -272,8 +272,13 @@ def parse_eval_args() -> argparse.Namespace:
         "--group_method",
         type=str,
         default="dgsm",
-        choices=["dgsm", "dgsm_cdkm", "cdkm", "aism", "cdkm_aism", "dgsm_aism", "psca", "pca"],
-        help="Stage-1 token grouping: dgsm (default), aism (CDKM-AISM), dgsm_aism (DGSM init + AISM refinement), or psca. K = need_token_num/4.",
+        choices=["dgsm", "dgsm_cdkm", "cdkm", "dgsm_kmeans", "dgsm_lloyd", "lloyd", "aism", "cdkm_aism", "dgsm_aism", "psca", "pca"],
+        help=(
+            "Stage-1 token grouping. "
+            "dgsm=faithful DGSM-CDKM (CPU Numba lossless); "
+            "dgsm_kmeans=GPU Lloyd + DGSM split/merge (faster, not bit-exact); "
+            "psca=original PCA grouping. K = need_token_num/4."
+        ),
     )
     args = parser.parse_args()
     return args

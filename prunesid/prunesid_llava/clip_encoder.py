@@ -56,12 +56,15 @@ def batch_pca(features, min_components=32):
 
 
 def group_tokens(features, min_components=32, group_method="dgsm"):
-    """Stage-1 grouping with PSCA, DGSM-CDKM, CDKM-AISM, or DGSM+AISM."""
+    """Stage-1 grouping: psca / dgsm (CDKM) / dgsm_kmeans (GPU Lloyd) / aism."""
     if group_method in (None, "psca", "pca"):
         return batch_pca(features, min_components=min_components)
     if group_method in ("dgsm", "dgsm_cdkm", "cdkm"):
         from prunesid.clustering import batch_dgsm_cdkm
         return batch_dgsm_cdkm(features, min_components=min_components, drop_cls=True)
+    if group_method in ("dgsm_kmeans", "dgsm_lloyd", "lloyd"):
+        from prunesid.clustering import batch_dgsm_kmeans
+        return batch_dgsm_kmeans(features, min_components=min_components, drop_cls=True)
     if group_method in ("aism", "cdkm_aism"):
         from prunesid.clustering import batch_cdkm_aism
         return batch_cdkm_aism(
@@ -73,7 +76,8 @@ def group_tokens(features, min_components=32, group_method="dgsm"):
             features, min_components=min_components, drop_cls=True, init_mode="dgsm"
         )
     raise ValueError(
-        f"Unknown group_method={group_method!r}; use 'psca', 'dgsm', 'aism', or 'dgsm_aism'"
+        f"Unknown group_method={group_method!r}; "
+        f"use 'psca', 'dgsm', 'dgsm_kmeans', 'aism', or 'dgsm_aism'"
     )
 
 
