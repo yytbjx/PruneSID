@@ -70,6 +70,14 @@ def group_tokens(features, min_components=32, group_method="dgsm", token_importa
             drop_cls=True,
             token_importance=token_importance,
         )
+    if group_method in ("dgsm_km_att", "dgsm_att", "km_att"):
+        from prunesid.clustering import batch_dgsm_km_att
+        return batch_dgsm_km_att(
+            features,
+            min_components=min_components,
+            drop_cls=True,
+            token_importance=token_importance,
+        )
     if group_method in ("aism", "cdkm_aism"):
         from prunesid.clustering import batch_cdkm_aism
         return batch_cdkm_aism(
@@ -82,7 +90,7 @@ def group_tokens(features, min_components=32, group_method="dgsm", token_importa
         )
     raise ValueError(
         f"Unknown group_method={group_method!r}; "
-        f"use 'psca', 'dgsm', 'dgsm_kmeans', 'aism', or 'dgsm_aism'"
+        f"use 'psca', 'dgsm', 'dgsm_kmeans', 'dgsm_km_att', 'aism', or 'dgsm_aism'"
     )
 
 

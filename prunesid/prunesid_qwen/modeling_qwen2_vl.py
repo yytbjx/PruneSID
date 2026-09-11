@@ -39,6 +39,15 @@ def group_tokens_qwen(features, min_components=32, group_method="dgsm"):
             drop_cls=False,
         )
         return soft[0], belong[0]
+    if group_method in ("dgsm_km_att", "dgsm_att", "km_att"):
+        from prunesid.clustering import batch_dgsm_km_att
+        soft, belong = batch_dgsm_km_att(
+            features.unsqueeze(0),
+            min_components=min_components,
+            drop_cls=False,
+            token_importance=None,
+        )
+        return soft[0], belong[0]
     if group_method in ("aism", "cdkm_aism"):
         from prunesid.clustering import batch_cdkm_aism
         soft, belong = batch_cdkm_aism(
@@ -59,7 +68,7 @@ def group_tokens_qwen(features, min_components=32, group_method="dgsm"):
         return soft[0], belong[0]
     raise ValueError(
         f"Unknown group_method={group_method!r}; "
-        f"use 'psca', 'dgsm', 'dgsm_kmeans', 'aism', or 'dgsm_aism'"
+        f"use 'psca', 'dgsm', 'dgsm_kmeans', 'dgsm_km_att', 'aism', or 'dgsm_aism'"
     )
 
 

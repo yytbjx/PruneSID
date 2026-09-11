@@ -595,7 +595,14 @@ def _merge_cost_from_gram(
     sn: torch.Tensor,
     cluster_imp: Optional[torch.Tensor] = None,
     merge_imp_lambda: float = 0.1,
+    imp_pair: str = "mean",
 ) -> torch.Tensor:
+    """
+    Pairwise merge score (higher = merge first).
+
+    Base: DGSM SSE gain from Gram.
+    Optional: G' = G - λ A_ij, A_ij = mean/max of cluster importance I_c.
+    """
     _B, K = counts.shape
     device = counts.device
     ti = counts.unsqueeze(2)
@@ -605,11 +612,14 @@ def _merge_cost_from_gram(
     )
     denom = ti * tj * (ti + tj)
     cost = numer / denom.clamp_min(torch.finfo(counts.dtype).tiny)
-    # P2: M' = M - λ max(I_i, I_j)  (prefer merging less important clusters)
     if cluster_imp is not None and merge_imp_lambda > 0:
         ii = cluster_imp.unsqueeze(2)
         jj = cluster_imp.unsqueeze(1)
-        cost = cost - merge_imp_lambda * torch.maximum(ii, jj)
+        if imp_pair == "max":
+            a_ij = torch.maximum(ii, jj)
+        else:
+            a_ij = 0.5 * (ii + jj)
+        cost = cost - merge_imp_lambda * a_ij
     invalid = (counts.unsqueeze(2) <= 0) | (counts.unsqueeze(1) <= 0)
     cost = cost.masked_fill(invalid, float("-inf"))
     eye = torch.eye(K, dtype=torch.bool, device=device).unsqueeze(0)
@@ -624,7 +634,7 @@ def _gram_merge_pair(
     sn: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
-    cluster_imp: Optional[torch.Tensor] = None,
+    att_sum: Optional[torch.Tensor] = None,
 ) -> None:
     B, K, _D = sums.shape
     device, dtype = sums.device, sums.dtype
@@ -645,10 +655,10 @@ def _gram_merge_pair(
     sums[batch, b] = torch.where(do.unsqueeze(-1), torch.zeros_like(sb), sb)
     counts[batch, b] = torch.where(do, torch.zeros_like(cb), cb)
 
-    if cluster_imp is not None:
-        ia, ib = cluster_imp[batch, a], cluster_imp[batch, b]
-        cluster_imp[batch, a] = torch.where(do, ia + ib, ia)
-        cluster_imp[batch, b] = torch.where(do, torch.zeros_like(ib), ib)
+    if att_sum is not None:
+        aa, ab = att_sum[batch, a], att_sum[batch, b]
+        att_sum[batch, a] = torch.where(do, aa + ab, aa)
+        att_sum[batch, b] = torch.where(do, torch.zeros_like(ab), ab)
 
     g_a = torch.bmm(sums[batch, a].unsqueeze(1), sums.transpose(1, 2)).squeeze(1)
     zero_k = torch.zeros(B, K, dtype=dtype, device=device)
@@ -664,6 +674,20 @@ def _gram_merge_pair(
     sn[batch, b] = torch.where(do, torch.zeros_like(cb), sn[batch, b])
 
 
+def _att_sum_from_labels(
+    labels: torch.Tensor, token_imp: torch.Tensor, k: int
+) -> torch.Tensor:
+    """Σ a_i per cluster. [B,N] -> [B,K]."""
+    dtype = token_imp.dtype
+    oh = F.one_hot(labels.clamp(0, k - 1), k).to(dtype=dtype)
+    return torch.bmm(oh.transpose(1, 2), token_imp.unsqueeze(-1)).squeeze(-1)
+
+
+def _imp_from_att_sum(att_sum: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    """I_c = (Σ a) / sqrt(n_c)."""
+    return att_sum / counts.clamp_min(1.0).sqrt()
+
+
 def _merge_back_gpu(
     data: torch.Tensor,
     labels: torch.Tensor,
@@ -672,6 +696,7 @@ def _merge_back_gpu(
     point_sq: torch.Tensor,
     token_imp: Optional[torch.Tensor] = None,
     merge_imp_lambda: float = 0.1,
+    imp_pair: str = "mean",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, N, _D = data.shape
     device, dtype = data.device, data.dtype
@@ -680,10 +705,8 @@ def _merge_back_gpu(
     counts, sums, sum_x2 = _stats_from_labels(data, labels, max_k, point_sq)
     gram = torch.bmm(sums, sums.transpose(1, 2))
     sn = torch.diagonal(gram, dim1=1, dim2=2).clone()
-    cluster_imp = (
-        _cluster_importance(labels, token_imp, max_k)
-        if token_imp is not None
-        else None
+    att_sum = (
+        _att_sum_from_labels(labels, token_imp, max_k) if token_imp is not None else None
     )
 
     parent = (
@@ -693,8 +716,16 @@ def _merge_back_gpu(
     eye = torch.eye(max_k, dtype=torch.bool, device=device)
 
     for _ in range(max_k - k):
+        cluster_imp = (
+            _imp_from_att_sum(att_sum, counts) if att_sum is not None else None
+        )
         cost = _merge_cost_from_gram(
-            counts, gram, sn, cluster_imp=cluster_imp, merge_imp_lambda=merge_imp_lambda
+            counts,
+            gram,
+            sn,
+            cluster_imp=cluster_imp,
+            merge_imp_lambda=merge_imp_lambda,
+            imp_pair=imp_pair,
         )
         cost = cost.masked_fill(eye.unsqueeze(0), float("-inf"))
         cost = cost.masked_fill(~triu.unsqueeze(0), float("-inf"))
@@ -715,7 +746,7 @@ def _merge_back_gpu(
         sum_x2[batch, bj] = torch.where(
             valid_pair, torch.zeros_like(sum_x2[batch, bj]), sum_x2[batch, bj]
         )
-        _gram_merge_pair(counts, sums, gram, sn, bi, b_m, cluster_imp=cluster_imp)
+        _gram_merge_pair(counts, sums, gram, sn, bi, b_m, att_sum=att_sum)
 
         match = (parent == bj.unsqueeze(1)) & valid_pair.unsqueeze(1)
         parent = torch.where(match, bi.unsqueeze(1).expand(B, max_k), parent)
@@ -754,6 +785,7 @@ def batch_dgsm_kmeans(
     use_spatial_split: bool = True,
     split_imp_alpha: float = 1.0,
     merge_imp_lambda: float = 0.1,
+    merge_imp_pair: str = "mean",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     DGSM-KM+ clustering.
@@ -836,6 +868,7 @@ def batch_dgsm_kmeans(
             point_sq=point_sq,
             token_imp=tok_imp,
             merge_imp_lambda=merge_imp_lambda,
+            imp_pair=merge_imp_pair,
         )
         nonempty = counts > 0
         centers = sums / counts.clamp_min(1.0).unsqueeze(-1)
