@@ -5,9 +5,10 @@ Design:
   Split  : argmax SSE  (where more capacity is needed)
   Merge  : G' = G_DGSM - λ · A_ij
            I_c = (Σ a_i) / √n_c
-           A_ij = (I_i + I_j) / 2
+           A_ij = max(I_i, I_j)
            → low-importance / redundant clusters merge first;
              high-attention fine detail (OCR / count / position) is protected.
+             Using max (not mean) so one important cluster blocks the merge.
 
 Implementation:
   Thin preset over ``batch_dgsm_kmeans`` (shared Exact GPU backend).
@@ -42,7 +43,7 @@ def batch_dgsm_km_att(
     do_split_merge: bool = True,
     *,
     token_importance: Optional[torch.Tensor] = None,
-    merge_imp_lambda: float = 0.15,
+    merge_imp_lambda: float = 0.05,
     oversplit_ratio: float = 1.25,
     global_var_dims: int = 16,
     sse_rel_tol: float = 1e-3,
@@ -52,9 +53,15 @@ def batch_dgsm_km_att(
     """
     SSE split + attention-aware merge (batch-invariant via shared Exact backend).
 
+    Defaults (DGSM-KM-SA v1):
+      split_imp_alpha=0, use_spatial_split=False,
+      merge_imp_pair=\"max\", merge_imp_lambda=0.05
+
+    Sweep λ ∈ {0, 0.03, 0.05, 0.1} for MME. Avoid λ≳0.15 (attention can dominate SSE).
+
     token_importance: [B, N_patches] (or [B, N+1] with CLS). Recommended:
-    CLS attention sum already available in PruneSID LLaVA forward.
-    If None, falls back to pure DGSM merge (λ effectively unused).
+    CLS attention sum already available in PruneSID LLaVA forward (no extra forward).
+    If None, falls back to pure DGSM merge (λ unused).
     """
     return batch_dgsm_kmeans(
         features,
@@ -69,11 +76,11 @@ def batch_dgsm_km_att(
         final_max_iters=final_max_iters,
         split_num=split_num,
         token_importance=token_importance,
-        # SA recipe (no spatial / no attention-on-split):
+        # SA v1 recipe:
         use_spatial_split=False,
         split_imp_alpha=0.0,
         merge_imp_lambda=merge_imp_lambda,
-        merge_imp_pair="mean",
+        merge_imp_pair="max",
     )
 
 
